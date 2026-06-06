@@ -77,6 +77,11 @@ export class HttpClient {
         );
       } else if (response.status === 429) {
         errorClass = "server_error";
+      } else if (response.status === 404) {
+        // Run-start is persisted asynchronously, so an event or finish can
+        // arrive before its run row exists. Treat 404 as transient and retry
+        // with backoff rather than dropping it.
+        errorClass = "server_error";
       } else {
         errorClass = "client_error";
       }

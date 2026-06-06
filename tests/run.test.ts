@@ -52,8 +52,10 @@ describe("Run lifecycle", () => {
 
     const evtCall = calls.find((c) => c.url.includes("/events"));
     expect(evtCall).toBeTruthy();
-    const body = evtCall!.body as { events: Array<{ id: string; type: string }> };
-    expect(body.events[0]!.id).toMatch(/^evt_eu_[0-9a-f]{32}$/);
+    const body = evtCall!.body as {
+      events: Array<{ external_id: string; type: string }>;
+    };
+    expect(body.events[0]!.external_id).toMatch(/^evt_eu_[0-9a-f]{32}$/);
     expect(body.events[0]!.type).toBe("log");
   });
 

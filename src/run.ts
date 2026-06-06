@@ -60,7 +60,7 @@ export class Run {
       }
       const evtId = newId("evt", this.state.region);
       const event: Record<string, unknown> = {
-        id: evtId,
+        external_id: evtId,
         type,
         ts: new Date().toISOString(),
         data,
