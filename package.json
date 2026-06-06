@@ -1,0 +1,45 @@
+{
+  "name": "@agentping/sdk",
+  "version": "0.1.0",
+  "description": "AgentPing SDK for TypeScript and JavaScript. Production observability for AI agents.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build && npm test",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.30.1",
+    "@types/node": "^20.11.0",
+    "openai": "^4.65.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": "*",
+    "openai": "*"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": { "optional": true },
+    "openai": { "optional": true }
+  }
+}
