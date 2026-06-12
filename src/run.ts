@@ -7,6 +7,11 @@ export interface RunStartOptions {
   feature?: string;
   metadata?: Record<string, unknown>;
   parentRunId?: string;
+  /**
+   * What the run is supposed to achieve. Feeds AgentPing's evaluations;
+   * without it the review has little to judge against.
+   */
+  goal?: string;
 }
 
 export interface RunFinishOptions {
@@ -38,6 +43,7 @@ export class Run {
     };
     if (options.customerId) body["customer_id"] = options.customerId;
     if (options.feature) body["feature"] = options.feature;
+    if (options.goal) body["goal"] = options.goal;
     if (options.metadata) body["metadata"] = options.metadata;
     const parent =
       options.parentRunId ??

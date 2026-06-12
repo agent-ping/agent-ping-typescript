@@ -135,4 +135,38 @@ describe("Run lifecycle", () => {
     expect(body["feature"]).toBe("triage");
     expect(body["metadata"]).toEqual({ region: "uk" });
   });
+
+  it("run start body carries goal when set and omits it otherwise", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: JSON.parse(init!.body as string) });
+      return new Response("{}", { status: 202 });
+    });
+    agentping.init({
+      apiKey: VALID_KEY,
+      baseUrl: "https://api.example.com",
+      flushIntervalMs: 5,
+      batchSize: 10,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    agentping.run("digest", { goal: "Send the daily digest" });
+    agentping.run("digest-two");
+    await agentping.flush({ timeoutMs: 1_000 });
+
+    const starts = calls.filter(
+      (c) => c.url.endsWith("/v1/runs") && !c.url.includes("events"),
+    );
+    const withGoal = starts.find(
+      (c) => (c.body as Record<string, unknown>)["agent"] === "digest",
+    );
+    const withoutGoal = starts.find(
+      (c) => (c.body as Record<string, unknown>)["agent"] === "digest-two",
+    );
+    expect((withGoal!.body as Record<string, unknown>)["goal"]).toBe(
+      "Send the daily digest",
+    );
+    expect(withoutGoal!.body as Record<string, unknown>).not.toHaveProperty(
+      "goal",
+    );
+  });
 });
