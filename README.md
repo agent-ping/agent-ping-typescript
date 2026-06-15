@@ -47,6 +47,48 @@ agentping.heartbeat("daily-summary", {
 });
 ```
 
+## Guard (spend safety net)
+
+Put a guard at the top of a scheduled or autonomous script. It makes one awaited
+call to AgentPing, which checks your configured rules against your real
+cumulative spend, and refuses to start the run if a rule is tripped (or if an
+operator has paused the agent from the dashboard). Guard is on the Team and
+Business plans.
+
+```ts
+// Hard mode (default): throws on block, so the run does not proceed.
+await agentping.guard.check({
+  customerRef: "acme-corp",
+  agent: "nightly-summariser",
+  function: "run",
+});
+```
+
+By default a guard fails closed: `mode: "hard"` throws `agentping.Paused` on a
+block, and `onUnreachable: "block"` means the script does not run unless the gate
+confirms it is safe. That couples your scheduled runs to AgentPing's uptime; pass
+`onUnreachable: "allow"` to run when the gate is unreachable.
+
+```ts
+try {
+  await agentping.guard.check({ agent: "nightly-summariser" });
+} catch (e) {
+  if (e instanceof agentping.Paused) {
+    console.warn("blocked by", e.verdict.blockedBy, e.verdict.rules);
+  }
+  throw e;
+}
+
+// Soft mode: branch on the verdict instead of throwing.
+const v = await agentping.guard.check({ agent: "nightly-summariser", mode: "soft" });
+if (v.blocked) process.exit(0);
+```
+
+A guard at the top of a script protects against the *next invocation* starting,
+not against one run that passes the check and then loops forever. Drop
+`guard.check(...)` at several points to turn it into a series of gates.
+Thresholds are set in USD.
+
 ## Auto-instrumentation
 
 Wrap a provider client to capture `llm_call` events automatically. No
@@ -140,6 +182,8 @@ await agentping.flush({ timeoutMs: 5000 });
   region-aware: `apk_eu_*` routes to `https://eu.ingest.agentping.io`,
   `apk_us_*` routes to `https://us.ingest.agentping.io`. Override only
   when self-hosting or testing.
+- `AGENTPING_CONTROL_URL`, override the control-plane URL used by
+  `guard.check`. Region-derived (EU: `https://agentping.io`).
 - `AGENTPING_PARENT_RUN`, parent run id for nested agents.
 
 ## License

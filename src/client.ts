@@ -110,6 +110,51 @@ export class HttpClient {
       clearTimeout(timer);
     }
   }
+
+  /**
+   * POST and return the raw result, emitting no warnings. The guard gate uses
+   * this so it can own its own allow/block/unreachable translation
+   * (guard-checks-spec) rather than the telemetry warn-and-retry semantics of
+   * post(). A network error or timeout surfaces as status 0.
+   */
+  async postRaw(path: string, payload: unknown): Promise<HttpResult> {
+    const url = `${this.baseUrl}${path}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${this.apiKey}`,
+          "user-agent": "agentping-ts/0.1",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      let body: unknown = null;
+      if (text) {
+        try {
+          body = JSON.parse(text);
+        } catch {
+          body = text;
+        }
+      }
+      const result: HttpResult = {
+        ok: response.ok,
+        status: response.status,
+        body,
+      };
+      const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+      if (retryAfter !== undefined) result.retryAfterMs = retryAfter;
+      return result;
+    } catch {
+      return { ok: false, status: 0, body: null, errorClass: "network_error" };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function parseRetryAfter(header: string | null): number | undefined {

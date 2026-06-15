@@ -13,6 +13,11 @@ export { Run } from "./run.js";
 export type { RunStartOptions, RunFinishOptions } from "./run.js";
 export type { InitOptions, StatusSnapshot } from "./state.js";
 
+// The guard gate (guard-checks-spec): agentping.guard.check(...).
+export * as guard from "./guard.js";
+export { Paused } from "./guard.js";
+export type { GuardVerdict, GuardCheckOptions } from "./guard.js";
+
 export function init(options: InitOptions = {}): void {
   initState(options);
 }
@@ -33,7 +38,10 @@ export interface HeartbeatOptions {
   outputTokens?: number;
 }
 
-export function heartbeat(agent: string, options: HeartbeatOptions = {}): string {
+export function heartbeat(
+  agent: string,
+  options: HeartbeatOptions = {},
+): string {
   const state = requireState();
   const now = Date.now();
   const finishedAt = new Date(now).toISOString();
@@ -52,8 +60,10 @@ export function heartbeat(agent: string, options: HeartbeatOptions = {}): string
   if (options.metadata) body["metadata"] = options.metadata;
   if (options.customerId) body["customer_id"] = options.customerId;
   if (options.feature) body["feature"] = options.feature;
-  if (options.inputTokens !== undefined) body["input_tokens"] = options.inputTokens;
-  if (options.outputTokens !== undefined) body["output_tokens"] = options.outputTokens;
+  if (options.inputTokens !== undefined)
+    body["input_tokens"] = options.inputTokens;
+  if (options.outputTokens !== undefined)
+    body["output_tokens"] = options.outputTokens;
 
   state.queue.push({ kind: "heartbeat", body });
   state.worker.notifyEnqueued();
@@ -87,7 +97,10 @@ export { instrumentGemini } from "./instrumentation/gemini.js";
 export { instrumentMistral } from "./instrumentation/mistral.js";
 export { instrumentCohere } from "./instrumentation/cohere.js";
 export { instrumentBedrock } from "./instrumentation/bedrock.js";
-export { withAgentPing, agentPingOnFinish } from "./instrumentation/vercel-ai.js";
+export {
+  withAgentPing,
+  agentPingOnFinish,
+} from "./instrumentation/vercel-ai.js";
 export { AgentPingHooks } from "./instrumentation/openai-agents.js";
 export { AgentPingLangChainCallbackHandler } from "./instrumentation/langchain.js";
 export { runScope, runScopeAsync, getActiveRun } from "./context.js";

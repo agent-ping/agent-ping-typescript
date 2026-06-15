@@ -4,7 +4,11 @@ import { Worker } from "./worker.js";
 import { warnOnce } from "./warnings.js";
 import { registerExitHandler } from "./exit.js";
 
-export type EnvelopeKind = "run_start" | "run_finish" | "run_events" | "heartbeat";
+export type EnvelopeKind =
+  | "run_start"
+  | "run_finish"
+  | "run_events"
+  | "heartbeat";
 
 export interface RunStartEnvelope {
   kind: "run_start";
@@ -37,6 +41,7 @@ export type Envelope =
 export interface InitOptions {
   apiKey?: string;
   baseUrl?: string;
+  controlUrl?: string;
   queueSize?: number;
   flushIntervalMs?: number;
   batchSize?: number;
@@ -53,10 +58,12 @@ export interface StatusSnapshot {
 export interface SdkState {
   apiKey: string;
   baseUrl: string;
+  controlUrl: string;
   region: string;
   queue: BoundedQueue<Envelope>;
   worker: Worker;
   client: HttpClient;
+  controlClient: HttpClient;
   flushIntervalMs: number;
   batchSize: number;
 }
@@ -78,6 +85,17 @@ export function defaultBaseUrlForRegion(region: string): string {
   return `https://${r}.ingest.agentping.io`;
 }
 
+/**
+ * Control-plane hostname for the SDK to call (guard-checks-spec). The guard
+ * gate is served by the control plane, not the ingest edge, so it has its own
+ * base URL. The EU control plane is served at the apex; other regions are
+ * subdomained.
+ */
+export function defaultControlUrlForRegion(region: string): string {
+  const r = KNOWN_REGIONS.has(region) ? region : DEFAULT_REGION;
+  return r === "eu" ? "https://agentping.io" : `https://${r}.agentping.io`;
+}
+
 let current: SdkState | null = null;
 
 export function getState(): SdkState | null {
@@ -94,13 +112,23 @@ export function requireState(): SdkState {
 export function initState(options: InitOptions = {}): SdkState {
   const apiKey =
     options.apiKey ??
-    (typeof process !== "undefined" ? process.env["AGENTPING_API_KEY"] : undefined) ??
+    (typeof process !== "undefined"
+      ? process.env["AGENTPING_API_KEY"]
+      : undefined) ??
     "";
   const region = extractRegionLocal(apiKey);
   const baseUrl =
     options.baseUrl ??
-    (typeof process !== "undefined" ? process.env["AGENTPING_BASE_URL"] : undefined) ??
+    (typeof process !== "undefined"
+      ? process.env["AGENTPING_BASE_URL"]
+      : undefined) ??
     defaultBaseUrlForRegion(region);
+  const controlUrl =
+    options.controlUrl ??
+    (typeof process !== "undefined"
+      ? process.env["AGENTPING_CONTROL_URL"]
+      : undefined) ??
+    defaultControlUrlForRegion(region);
 
   if (!apiKey) {
     warnOnce(
@@ -112,10 +140,17 @@ export function initState(options: InitOptions = {}): SdkState {
   if (current) {
     current.worker.stop();
   }
-  const queue = new BoundedQueue<Envelope>(options.queueSize ?? DEFAULT_QUEUE_SIZE);
+  const queue = new BoundedQueue<Envelope>(
+    options.queueSize ?? DEFAULT_QUEUE_SIZE,
+  );
   const client = new HttpClient({
     apiKey,
     baseUrl,
+    fetchImpl: options.fetchImpl,
+  });
+  const controlClient = new HttpClient({
+    apiKey,
+    baseUrl: controlUrl,
     fetchImpl: options.fetchImpl,
   });
   const flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
@@ -125,10 +160,12 @@ export function initState(options: InitOptions = {}): SdkState {
   current = {
     apiKey,
     baseUrl,
+    controlUrl,
     region,
     queue,
     worker,
     client,
+    controlClient,
     flushIntervalMs,
     batchSize,
   };
