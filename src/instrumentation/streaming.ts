@@ -21,6 +21,17 @@ export function wrapAsyncIterable<TChunk>(
           // swallow
         }
       };
+      // A failed stream reports through onError only. Marking it done here
+      // keeps onDone (and its success-shaped llm_call) from firing as well.
+      const fail = (err: unknown): void => {
+        if (done) return;
+        done = true;
+        try {
+          observer.onError(err);
+        } catch {
+          // swallow
+        }
+      };
       return {
         async next(): Promise<IteratorResult<TChunk>> {
           try {
@@ -36,12 +47,7 @@ export function wrapAsyncIterable<TChunk>(
             }
             return result;
           } catch (err) {
-            try {
-              observer.onError(err);
-            } catch {
-              // swallow
-            }
-            finalize();
+            fail(err);
             throw err;
           }
         },
@@ -51,12 +57,7 @@ export function wrapAsyncIterable<TChunk>(
           return { done: true, value: value as TChunk };
         },
         async throw(err): Promise<IteratorResult<TChunk>> {
-          try {
-            observer.onError(err);
-          } catch {
-            // swallow
-          }
-          finalize();
+          fail(err);
           if (inner.throw) return inner.throw(err);
           throw err;
         },

@@ -18,6 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   cached calls were priced too low. Every wrapper now reports gross.
 - `withAgentPing()` no longer emits a stray `finish_reason` event. The
   finish reason is a field on `llm_call`.
+- A stream that fails part way through emits one errored `llm_call`
+  only. Earlier builds also emitted a success-shaped `llm_call` when
+  the broken stream was closed.
 
 ### Added
 
