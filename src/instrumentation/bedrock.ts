@@ -7,12 +7,19 @@
  * events with provider="bedrock", the model id, token counts, and latency.
  *
  * The AWS SDK v3 uses a command pattern: client.send(new ConverseCommand({...})).
- * We wrap `send` and detect the command class via its constructor name —
+ * We wrap `send` and detect the command class via its constructor name,
  * which is stable across the AWS SDK and survives minification (the SDK
  * sets `Command.name` explicitly).
  */
 
-import { getActiveRun } from "../context.js";
+import {
+  emitErroredLlmCall,
+  isPromiseLike,
+  putIfPositive,
+  putIfString,
+  resolveRun,
+  type InstrumentOptions,
+} from "./shared.js";
 
 interface BedrockUsage {
   inputTokens?: number;
@@ -22,9 +29,13 @@ interface BedrockUsage {
   cacheWriteInputTokens?: number;
 }
 
+interface BedrockContentBlock {
+  toolUse?: unknown;
+}
+
 interface BedrockConverseResponse {
   usage?: BedrockUsage;
-  output?: unknown;
+  output?: { message?: { content?: BedrockContentBlock[] } };
   stopReason?: string;
 }
 
@@ -33,8 +44,10 @@ interface BedrockInvokeModelResponse {
   $metadata?: { httpHeaders?: Record<string, string> };
 }
 
-interface BedrockConverseStreamResponse {
-  stream?: AsyncIterable<{ metadata?: { usage?: BedrockUsage } }>;
+interface BedrockStreamEvent {
+  metadata?: { usage?: BedrockUsage };
+  messageStop?: { stopReason?: string };
+  contentBlockStart?: { start?: { toolUse?: unknown } };
 }
 
 interface CommandInput {
@@ -50,13 +63,7 @@ interface BedrockRuntimeClientLike {
   send: (command: AWSCommand, ...rest: unknown[]) => unknown;
 }
 
-interface RunLike {
-  event: (type: string, data: Record<string, unknown>) => void;
-}
-
-interface InstrumentOptions {
-  run?: RunLike;
-}
+const PROVIDER = "bedrock";
 
 const CHAT_COMMANDS = new Set(["ConverseCommand", "InvokeModelCommand"]);
 const STREAM_COMMANDS = new Set([
@@ -91,7 +98,7 @@ export function instrumentBedrock<T extends BedrockRuntimeClientLike>(
     try {
       result = originalSend(command, ...rest);
     } catch (err) {
-      emitFailure(options, start, model, err);
+      emitErroredLlmCall(options, PROVIDER, model, start, err, isStream ? { stream: true } : {});
       throw err;
     }
 
@@ -126,10 +133,24 @@ function wrapChatPromise(
       return response;
     },
     (err: unknown) => {
-      emitFailure(options, start, model, err);
+      emitErroredLlmCall(options, PROVIDER, model, start, err);
       throw err;
     },
   );
+}
+
+/**
+ * Converse reports inputTokens net of cache reads and writes, as the
+ * underlying Anthropic models do. Ingest prices from gross input, so add
+ * them back and report the cached parts alongside.
+ */
+function putUsage(data: Record<string, unknown>, usage: BedrockUsage): void {
+  const cached = usage.cacheReadInputTokens ?? 0;
+  const cacheWrite = usage.cacheWriteInputTokens ?? 0;
+  data["input_tokens"] = (usage.inputTokens ?? 0) + cached + cacheWrite;
+  data["output_tokens"] = usage.outputTokens ?? 0;
+  putIfPositive(data, "cached_input_tokens", cached);
+  putIfPositive(data, "cache_creation_input_tokens", cacheWrite);
 }
 
 function emitChat(
@@ -139,24 +160,24 @@ function emitChat(
   commandName: string,
   response: BedrockConverseResponse | BedrockInvokeModelResponse,
 ): void {
-  const run = options.run ?? getActiveRun();
+  const run = resolveRun(options);
   if (!run) return;
   try {
     const latencyMs = Date.now() - start;
     const data: Record<string, unknown> = {
-      provider: "bedrock",
+      provider: PROVIDER,
       model,
       latency_ms: latencyMs,
     };
 
     if (commandName === "ConverseCommand") {
-      const usage = (response as BedrockConverseResponse).usage ?? {};
-      const input = usage.inputTokens ?? 0;
-      const cached = usage.cacheReadInputTokens ?? 0;
-      data["input_tokens"] = cached > 0 ? Math.max(0, input - cached) : input;
-      data["output_tokens"] = usage.outputTokens ?? 0;
-      if (cached > 0) data["cached_input_tokens"] = cached;
-      if (usage.cacheWriteInputTokens) data["cache_creation_input_tokens"] = usage.cacheWriteInputTokens;
+      const converse = response as BedrockConverseResponse;
+      putUsage(data, converse.usage ?? {});
+      putIfString(data, "finish_reason", converse.stopReason);
+      const toolCalls = (converse.output?.message?.content ?? []).filter(
+        (block) => block?.toolUse !== undefined,
+      ).length;
+      if (toolCalls > 0) data["tool_calls"] = toolCalls;
     } else {
       // InvokeModel: tokens come from $metadata.httpHeaders.
       const headers = (response as BedrockInvokeModelResponse).$metadata?.httpHeaders ?? {};
@@ -183,7 +204,7 @@ function wrapStreamPromise(
     return result.then(
       (response: unknown) => wrapStreamResult(response, options, start, model, commandName),
       (err: unknown) => {
-        emitFailure(options, start, model, err);
+        emitErroredLlmCall(options, PROVIDER, model, start, err, { stream: true });
         throw err;
       },
     );
@@ -207,18 +228,27 @@ function wrapStreamResult(
   if (!(Symbol.asyncIterator in stream)) return response;
 
   let lastUsage: BedrockUsage | undefined;
+  let stopReason: string | undefined;
+  let toolCalls = 0;
 
   const wrapped: AsyncIterable<unknown> = {
     async *[Symbol.asyncIterator]() {
+      let failed = false;
       try {
-        for await (const event of stream as AsyncIterable<{ metadata?: { usage?: BedrockUsage } }>) {
-          if (event && typeof event === "object" && "metadata" in event && event.metadata?.usage) {
-            lastUsage = event.metadata.usage;
+        for await (const event of stream as AsyncIterable<BedrockStreamEvent>) {
+          if (event && typeof event === "object") {
+            if (event.metadata?.usage) lastUsage = event.metadata.usage;
+            if (event.messageStop?.stopReason) stopReason = event.messageStop.stopReason;
+            if (event.contentBlockStart?.start?.toolUse !== undefined) toolCalls += 1;
           }
           yield event;
         }
+      } catch (err) {
+        failed = true;
+        emitErroredLlmCall(options, PROVIDER, model, start, err, { stream: true });
+        throw err;
       } finally {
-        emitStreamEnd(options, start, model, lastUsage);
+        if (!failed) emitStreamEnd(options, start, model, lastUsage, stopReason, toolCalls);
       }
     },
   };
@@ -236,54 +266,24 @@ function emitStreamEnd(
   start: number,
   model: string,
   usage: BedrockUsage | undefined,
+  stopReason: string | undefined,
+  toolCalls: number,
 ): void {
-  const run = options.run ?? getActiveRun();
+  const run = resolveRun(options);
   if (!run) return;
   try {
     const latencyMs = Date.now() - start;
     const data: Record<string, unknown> = {
-      provider: "bedrock",
+      provider: PROVIDER,
       model,
       latency_ms: latencyMs,
+      stream: true,
     };
-    if (usage) {
-      const input = usage.inputTokens ?? 0;
-      const cached = usage.cacheReadInputTokens ?? 0;
-      data["input_tokens"] = cached > 0 ? Math.max(0, input - cached) : input;
-      data["output_tokens"] = usage.outputTokens ?? 0;
-      if (cached > 0) data["cached_input_tokens"] = cached;
-    }
+    if (usage) putUsage(data, usage);
+    putIfString(data, "finish_reason", stopReason);
+    if (toolCalls > 0) data["tool_calls"] = toolCalls;
     run.event("llm_call", data);
   } catch {
     // swallow
   }
-}
-
-function emitFailure(
-  options: InstrumentOptions,
-  start: number,
-  model: string,
-  err: unknown,
-): void {
-  const run = options.run ?? getActiveRun();
-  if (!run) return;
-  try {
-    run.event("llm_call_error", {
-      provider: "bedrock",
-      model,
-      latency_ms: Date.now() - start,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  } catch {
-    // swallow
-  }
-}
-
-function isPromiseLike<T = unknown>(value: unknown): value is PromiseLike<T> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "then" in value &&
-    typeof (value as { then: unknown }).then === "function"
-  );
 }

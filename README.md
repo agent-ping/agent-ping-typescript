@@ -135,12 +135,23 @@ const { text } = await generateText({
   ...agentping.withAgentPing(run),
 });
 
-// OpenAI Agents SDK (Python-compatible hook shape)
-import { Runner } from "@openai/agents";
-const result = await Runner.run(triageAgent, "billing question", {
-  hooks: new agentping.AgentPingHooks(run),
-});
+// OpenAI Agents SDK (lifecycle events on the Runner, model calls via the client)
+import OpenAI from "openai";
+import { Runner, setDefaultOpenAIClient } from "@openai/agents";
+setDefaultOpenAIClient(agentping.instrumentOpenAI(new OpenAI(), { run }));
+const runner = new agentping.AgentPingHooks(run).attach(new Runner());
+const result = await runner.run(triageAgent, "billing question");
 ```
+
+Every model call records `input_tokens` (gross, including any cached
+prefix), `output_tokens`, `cached_input_tokens`, `reasoning_tokens`,
+`finish_reason` and the number of tool calls. Failed calls are recorded
+as `llm_call` events with `status: "error"`, the message and the
+exception class, so an agent that dies on a rate limit still shows up.
+Tool calls from the frameworks above are recorded as `tool_call` events
+with their input and output (capped at 4000 characters). Pass
+`{ captureToolPayloads: false }` to the handler or hooks constructor to
+keep payloads out of AgentPing.
 
 Per-integration docs:
 [Anthropic](https://agentping.io/docs/providers/anthropic) ·

@@ -34,6 +34,11 @@ describe("instrumentAnthropic", () => {
       messages: {
         create: vi.fn(async (_args?: unknown) => ({
           model: "claude-sonnet-4-5",
+          stop_reason: "tool_use",
+          content: [
+            { type: "text", text: "Let me check." },
+            { type: "tool_use", id: "toolu_1", name: "lookup", input: {} },
+          ],
           usage: {
             input_tokens: 100,
             output_tokens: 50,
@@ -61,12 +66,57 @@ describe("instrumentAnthropic", () => {
     expect(llm).toBeTruthy();
     expect(llm!.data["provider"]).toBe("anthropic");
     expect(llm!.data["model"]).toBe("claude-sonnet-4-5");
-    expect(llm!.data["input_tokens"]).toBe(100);
+    // Anthropic reports input_tokens net of the cache; ingest wants gross.
+    expect(llm!.data["input_tokens"]).toBe(135);
     expect(llm!.data["output_tokens"]).toBe(50);
     expect(llm!.data["cached_input_tokens"]).toBe(25);
     expect(llm!.data["cache_creation_input_tokens"]).toBe(10);
+    expect(llm!.data["finish_reason"]).toBe("tool_use");
+    expect(llm!.data["tool_calls"]).toBe(1);
+    expect("stream" in llm!.data).toBe(false);
     expect(typeof llm!.data["latency_ms"]).toBe("number");
     expect("cost_usd" in llm!.data).toBe(false);
+  });
+
+  it("emits an errored llm_call when the provider rejects", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: JSON.parse(init!.body as string) });
+      return new Response("{}", { status: 202 });
+    });
+    agentping.init({
+      apiKey: VALID_KEY,
+      baseUrl: "https://api.example.com",
+      flushIntervalMs: 5,
+      batchSize: 10,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    class RateLimitError extends Error {}
+    const fakeClient = {
+      messages: {
+        create: vi.fn(async (_args?: unknown) => {
+          throw new RateLimitError("rate limited");
+        }),
+      },
+    };
+
+    const run = agentping.run("agent");
+    const wrapped = instrumentAnthropic(fakeClient, { run });
+    await expect(wrapped.messages.create({ model: "claude-sonnet-4-5" })).rejects.toThrow("rate limited");
+
+    await agentping.flush({ timeoutMs: 1_000 });
+
+    const eventCall = calls.find((c) => c.url.includes("/events"));
+    const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
+    const llm = body.events.find((e) => e.type === "llm_call")!;
+    expect(llm.data["provider"]).toBe("anthropic");
+    expect(llm.data["model"]).toBe("claude-sonnet-4-5");
+    expect(llm.data["status"]).toBe("error");
+    expect(llm.data["error"]).toBe("rate limited");
+    expect(llm.data["exception"]).toBe("RateLimitError");
+    expect(typeof llm.data["latency_ms"]).toBe("number");
+    expect("input_tokens" in llm.data).toBe(false);
   });
 
   it("does not crash if the wrapped client throws", async () => {
@@ -104,11 +154,21 @@ describe("instrumentAnthropic", () => {
       fetchImpl: fetchMock as unknown as typeof fetch,
     });
 
+    // Real event shapes: usage arrives on message_start (input side) and
+    // message_delta (cumulative output side); stop_reason rides message_delta.
     const chunks = [
-      { type: "message_start", message: { model: "claude-haiku-4", usage: { input_tokens: 12, output_tokens: 0 } } },
-      { type: "content_block_delta", usage: { output_tokens: 3 } },
-      { type: "content_block_delta", usage: { output_tokens: 4 } },
-      { type: "message_stop", usage: { output_tokens: 1 } },
+      {
+        type: "message_start",
+        message: {
+          model: "claude-haiku-4",
+          usage: { input_tokens: 12, output_tokens: 1, cache_read_input_tokens: 4 },
+        },
+      },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hi" } },
+      { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_1", name: "lookup" } },
+      { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 8 } },
+      { type: "message_stop" },
     ];
 
     async function* gen(): AsyncGenerator<unknown> {
@@ -145,8 +205,12 @@ describe("instrumentAnthropic", () => {
     const llm = body.events.find((e) => e.type === "llm_call");
     expect(llm).toBeTruthy();
     expect(llm!.data["model"]).toBe("claude-haiku-4");
-    expect(llm!.data["input_tokens"]).toBe(12);
-    expect(llm!.data["output_tokens"]).toBe(8);
+    expect(llm!.data["input_tokens"]).toBe(16); // 12 net + 4 cache read
+    expect(llm!.data["cached_input_tokens"]).toBe(4);
+    expect(llm!.data["output_tokens"]).toBe(8); // last message_delta wins, not a sum
+    expect(llm!.data["finish_reason"]).toBe("tool_use");
+    expect(llm!.data["tool_calls"]).toBe(1);
+    expect(llm!.data["stream"]).toBe(true);
   });
 
   it("returns the original client unchanged if shape is unexpected", () => {

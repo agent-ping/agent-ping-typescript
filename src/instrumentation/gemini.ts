@@ -1,16 +1,34 @@
-import { getActiveRun } from "../context.js";
 import { wrapAsyncIterable } from "./streaming.js";
+import {
+  emitErroredLlmCall,
+  isPromiseLike,
+  putIfPositive,
+  putIfString,
+  resolveRun,
+  type InstrumentOptions as BaseInstrumentOptions,
+} from "./shared.js";
 
 interface GeminiUsage {
   promptTokenCount?: number;
   candidatesTokenCount?: number;
   cachedContentTokenCount?: number;
+  thoughtsTokenCount?: number;
   totalTokenCount?: number;
+}
+
+interface GeminiPart {
+  functionCall?: unknown;
+}
+
+interface GeminiCandidate {
+  finishReason?: string;
+  content?: { parts?: GeminiPart[] };
 }
 
 interface GeminiResponse {
   usageMetadata?: GeminiUsage;
   modelVersion?: string;
+  candidates?: GeminiCandidate[];
 }
 
 interface GeminiModelsNamespace {
@@ -19,10 +37,7 @@ interface GeminiModelsNamespace {
   embedContent?: (...args: unknown[]) => unknown;
 }
 
-interface GeminiStreamChunk {
-  usageMetadata?: GeminiUsage;
-  modelVersion?: string;
-}
+type GeminiStreamChunk = GeminiResponse;
 
 interface GeminiEmbedResponse {
   usageMetadata?: { totalTokenCount?: number; promptTokenCount?: number };
@@ -32,14 +47,11 @@ interface GeminiClient {
   models: GeminiModelsNamespace;
 }
 
-interface RunLike {
-  event: (type: string, data: Record<string, unknown>) => void;
-}
-
-interface InstrumentOptions {
-  run?: RunLike;
+export interface InstrumentOptions extends BaseInstrumentOptions {
   mode?: "standard" | "batch";
 }
+
+const PROVIDER = "gemini";
 
 export function instrumentGemini<T extends GeminiClient>(
   client: T,
@@ -62,7 +74,7 @@ export function instrumentGemini<T extends GeminiClient>(
     try {
       result = originalGenerate(...args);
     } catch (err) {
-      emitFailure(options, start, requestedModel, err);
+      emitErroredLlmCall(options, PROVIDER, requestedModel, start, err);
       throw err;
     }
 
@@ -78,7 +90,7 @@ export function instrumentGemini<T extends GeminiClient>(
           const result = originalStream(...args);
           return wrapStreamPromise(result, options, start, requestedModel);
         } catch (err) {
-          emitFailure(options, start, requestedModel, err);
+          emitErroredLlmCall(options, PROVIDER, requestedModel, start, err, { stream: true });
           throw err;
         }
       }
@@ -93,7 +105,7 @@ export function instrumentGemini<T extends GeminiClient>(
           const result = originalEmbed(...args);
           return wrapEmbedPromise(result, options, start, requestedModel);
         } catch (err) {
-          emitFailure(options, start, requestedModel, err);
+          emitErroredLlmCall(options, PROVIDER, requestedModel, start, err, { kind: "embedding" });
           throw err;
         }
       }
@@ -126,7 +138,7 @@ function wrapStreamPromise(
     return result.then(
       (stream: unknown) => wrapStreamResult(stream, options, start, requestedModel),
       (err: unknown) => {
-        emitFailure(options, start, requestedModel, err);
+        emitErroredLlmCall(options, PROVIDER, requestedModel, start, err, { stream: true });
         throw err;
       },
     );
@@ -145,17 +157,29 @@ function wrapStreamResult(
 
   let model: string | undefined = requestedModel;
   let usage: GeminiUsage | undefined;
+  let finishReason: string | undefined;
+  let toolCalls = 0;
 
   return wrapAsyncIterable(stream as AsyncIterable<GeminiStreamChunk>, {
     onChunk(chunk: GeminiStreamChunk): void {
       if (chunk?.modelVersion) model = chunk.modelVersion;
+      // usageMetadata is cumulative, so the last chunk's value is the total.
       if (chunk?.usageMetadata) usage = chunk.usageMetadata;
+      const candidate = chunk?.candidates?.[0];
+      if (candidate?.finishReason) finishReason = candidate.finishReason;
+      toolCalls += countFunctionCalls(candidate);
     },
     onDone(): void {
-      emitLlmCall(options, start, model, { modelVersion: model, usageMetadata: usage });
+      emitLlmCall(
+        options,
+        start,
+        model,
+        { modelVersion: model, usageMetadata: usage },
+        { stream: true, finishReason, toolCalls },
+      );
     },
     onError(err: unknown): void {
-      emitFailure(options, start, model, err);
+      emitErroredLlmCall(options, PROVIDER, model, start, err, { stream: true });
     },
   });
 }
@@ -176,7 +200,7 @@ function wrapEmbedPromise(
       return response;
     },
     (err: unknown) => {
-      emitFailure(options, start, requestedModel, err);
+      emitErroredLlmCall(options, PROVIDER, requestedModel, start, err, { kind: "embedding" });
       throw err;
     },
   );
@@ -188,13 +212,13 @@ function emitEmbedding(
   requestedModel: string | undefined,
   response: GeminiEmbedResponse,
 ): void {
-  const run = options.run ?? getActiveRun();
+  const run = resolveRun(options);
   if (!run) return;
   try {
     const latencyMs = Date.now() - start;
     const total = response.usageMetadata?.totalTokenCount ?? response.usageMetadata?.promptTokenCount ?? 0;
     run.event("llm_call", {
-      provider: "gemini",
+      provider: PROVIDER,
       model: requestedModel ?? "unknown",
       kind: "embedding",
       input_tokens: total,
@@ -222,10 +246,14 @@ function wrapResponsePromise(
       return response;
     },
     (err: unknown) => {
-      emitFailure(options, start, requestedModel, err);
+      emitErroredLlmCall(options, PROVIDER, requestedModel, start, err);
       throw err;
     },
   );
+}
+
+function countFunctionCalls(candidate: GeminiCandidate | undefined): number {
+  return (candidate?.content?.parts ?? []).filter((p) => p?.functionCall !== undefined).length;
 }
 
 function emitLlmCall(
@@ -233,60 +261,34 @@ function emitLlmCall(
   start: number,
   requestedModel: string | undefined,
   response: GeminiResponse,
+  streamInfo?: { stream: true; finishReason?: string; toolCalls: number },
 ): void {
-  const run = options.run ?? getActiveRun();
+  const run = resolveRun(options);
   if (!run) return;
   try {
     const latencyMs = Date.now() - start;
     const usage = response.usageMetadata ?? {};
-    const prompt = usage.promptTokenCount ?? 0;
-    const cached = usage.cachedContentTokenCount ?? 0;
-    const uncached = cached > 0 ? Math.max(0, prompt - cached) : prompt;
+    const candidate = response.candidates?.[0];
+    const thoughts = usage.thoughtsTokenCount ?? 0;
 
+    // promptTokenCount is gross: it includes the cached content. Thinking
+    // tokens are billed as output but reported apart from candidatesTokenCount.
     const data: Record<string, unknown> = {
-      provider: "gemini",
+      provider: PROVIDER,
       model: response.modelVersion ?? requestedModel ?? "unknown",
-      input_tokens: uncached,
-      output_tokens: usage.candidatesTokenCount ?? 0,
+      input_tokens: usage.promptTokenCount ?? 0,
+      output_tokens: (usage.candidatesTokenCount ?? 0) + thoughts,
       latency_ms: latencyMs,
     };
-    if (cached > 0) {
-      data["cached_input_tokens"] = cached;
-    }
-    if (options.mode === "batch") {
-      data["mode"] = "batch";
-    }
+    putIfPositive(data, "cached_input_tokens", usage.cachedContentTokenCount);
+    putIfPositive(data, "reasoning_tokens", thoughts);
+    putIfString(data, "finish_reason", streamInfo?.finishReason ?? candidate?.finishReason);
+    const toolCalls = streamInfo ? streamInfo.toolCalls : countFunctionCalls(candidate);
+    if (toolCalls > 0) data["tool_calls"] = toolCalls;
+    if (streamInfo) data["stream"] = true;
+    if (options.mode === "batch") data["mode"] = "batch";
     run.event("llm_call", data);
   } catch {
     // swallow
   }
-}
-
-function emitFailure(
-  options: InstrumentOptions,
-  start: number,
-  model: string | undefined,
-  err: unknown,
-): void {
-  const run = options.run ?? getActiveRun();
-  if (!run) return;
-  try {
-    run.event("llm_call_error", {
-      provider: "gemini",
-      model: model ?? "unknown",
-      latency_ms: Date.now() - start,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  } catch {
-    // swallow
-  }
-}
-
-function isPromiseLike<T = unknown>(value: unknown): value is PromiseLike<T> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "then" in value &&
-    typeof (value as { then: unknown }).then === "function"
-  );
 }

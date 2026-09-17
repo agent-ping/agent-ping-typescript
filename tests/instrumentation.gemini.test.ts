@@ -16,7 +16,7 @@ describe("instrumentGemini", () => {
     vi.restoreAllMocks();
   });
 
-  it("captures token usage with cached subtraction", async () => {
+  it("captures gross token usage with the cached subset and thinking tokens", async () => {
     const calls: Array<{ url: string; body: unknown }> = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       calls.push({ url, body: JSON.parse(init!.body as string) });
@@ -34,10 +34,17 @@ describe("instrumentGemini", () => {
       models: {
         generateContent: vi.fn(async (_args?: unknown) => ({
           modelVersion: "gemini-2.0-flash",
+          candidates: [
+            {
+              finishReason: "STOP",
+              content: { parts: [{ text: "ok" }, { functionCall: { name: "lookup", args: {} } }] },
+            },
+          ],
           usageMetadata: {
             promptTokenCount: 300,
             candidatesTokenCount: 90,
             cachedContentTokenCount: 120,
+            thoughtsTokenCount: 30,
           },
         })),
       },
@@ -59,9 +66,14 @@ describe("instrumentGemini", () => {
     expect(llm).toBeTruthy();
     expect(llm!.data["provider"]).toBe("gemini");
     expect(llm!.data["model"]).toBe("gemini-2.0-flash");
-    expect(llm!.data["input_tokens"]).toBe(180);
+    // promptTokenCount already includes the cached content; ingest wants gross.
+    expect(llm!.data["input_tokens"]).toBe(300);
     expect(llm!.data["cached_input_tokens"]).toBe(120);
-    expect(llm!.data["output_tokens"]).toBe(90);
+    // Gemini reports thinking separately from candidates; output is the sum.
+    expect(llm!.data["output_tokens"]).toBe(120);
+    expect(llm!.data["reasoning_tokens"]).toBe(30);
+    expect(llm!.data["finish_reason"]).toBe("STOP");
+    expect(llm!.data["tool_calls"]).toBe(1);
     expect(llm!.data["latency_ms"]).toBeTypeOf("number");
   });
 
@@ -100,7 +112,7 @@ describe("instrumentGemini", () => {
     expect("cached_input_tokens" in llm.data).toBe(false);
   });
 
-  it("emits llm_call_error on rejection", async () => {
+  it("emits an errored llm_call on rejection", async () => {
     const calls: Array<{ url: string; body: unknown }> = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       calls.push({ url, body: JSON.parse(init!.body as string) });
@@ -131,8 +143,11 @@ describe("instrumentGemini", () => {
 
     const eventCall = calls.find((c) => c.url.includes("/events"));
     const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
-    const err = body.events.find((e) => e.type === "llm_call_error")!;
+    const err = body.events.find((e) => e.type === "llm_call")!;
     expect(err.data["provider"]).toBe("gemini");
+    expect(err.data["model"]).toBe("gemini-2.0-flash");
+    expect(err.data["status"]).toBe("error");
     expect(err.data["error"]).toBe("quota exhausted");
+    expect(err.data["exception"]).toBe("Error");
   });
 });

@@ -95,9 +95,14 @@ describe("Vercel AI SDK helper", () => {
     const helper = withAgentPing(run, { provider: "openai", model: "gpt-4o" });
     helper.onFinish({
       usage: { inputTokens: 100, outputTokens: 30 },
+      finishReason: "stop",
       toolCalls: [
-        { toolName: "search", toolCallId: "c1" },
-        { toolName: "fetch", toolCallId: "c2" },
+        { toolName: "search", toolCallId: "c1", input: { q: "laravel" } },
+        { toolName: "fetch", toolCallId: "c2", input: { url: "https://example.com" } },
+      ],
+      toolResults: [{ toolName: "search", toolCallId: "c1", output: { hits: 3 } }],
+      content: [
+        { type: "tool-error", toolCallId: "c2", toolName: "fetch", error: new TypeError("connection reset") },
       ],
     });
 
@@ -105,12 +110,56 @@ describe("Vercel AI SDK helper", () => {
 
     const eventCall = calls.find((c) => c.url.includes("/events"));
     const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
+    const llm = body.events.find((e) => e.type === "llm_call")!;
+    expect(llm.data["tool_calls"]).toBe(2);
+    expect(llm.data["finish_reason"]).toBe("stop");
+
     const toolCalls = body.events.filter((e) => e.type === "tool_call");
     expect(toolCalls).toHaveLength(2);
     expect(toolCalls.map((c) => c.data["tool"])).toEqual(["search", "fetch"]);
+    expect(toolCalls[0]!.data["status"]).toBe("success");
+    expect(toolCalls[0]!.data["tool_invocation_id"]).toBe("c1");
+    expect(toolCalls[0]!.data["input"]).toBe('{"q":"laravel"}');
+    expect(toolCalls[0]!.data["output"]).toBe('{"hits":3}');
+    expect(toolCalls[1]!.data["status"]).toBe("error");
+    expect(toolCalls[1]!.data["error"]).toBe("connection reset");
+    expect(toolCalls[1]!.data["exception"]).toBe("TypeError");
+    expect("output" in toolCalls[1]!.data).toBe(false);
   });
 
-  it("emits finish_reason event for non-stop reasons", async () => {
+  it("captureToolPayloads: false drops tool input and output", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: JSON.parse(init!.body as string) });
+      return new Response("{}", { status: 202 });
+    });
+    agentping.init({
+      apiKey: VALID_KEY,
+      baseUrl: "https://api.example.com",
+      flushIntervalMs: 5,
+      batchSize: 10,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    const run = agentping.run("agent");
+    const helper = withAgentPing(run, { provider: "openai", model: "gpt-4o", captureToolPayloads: false });
+    helper.onFinish({
+      usage: { inputTokens: 100, outputTokens: 30 },
+      toolCalls: [{ toolName: "search", toolCallId: "c1", input: { q: "laravel" } }],
+      toolResults: [{ toolName: "search", toolCallId: "c1", output: { hits: 3 } }],
+    });
+
+    await agentping.flush({ timeoutMs: 1_000 });
+
+    const eventCall = calls.find((c) => c.url.includes("/events"));
+    const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
+    const tool = body.events.find((e) => e.type === "tool_call")!;
+    expect(tool.data["tool"]).toBe("search");
+    expect("input" in tool.data).toBe(false);
+    expect("output" in tool.data).toBe(false);
+  });
+
+  it("carries finish_reason on the llm_call", async () => {
     const calls: Array<{ url: string; body: unknown }> = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       calls.push({ url, body: JSON.parse(init!.body as string) });
@@ -135,9 +184,49 @@ describe("Vercel AI SDK helper", () => {
 
     const eventCall = calls.find((c) => c.url.includes("/events"));
     const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
-    const finish = body.events.find((e) => e.type === "finish_reason");
-    expect(finish).toBeTruthy();
-    expect(finish!.data["reason"]).toBe("length");
+    expect(body.events.find((e) => e.type === "finish_reason")).toBeUndefined();
+    const llm = body.events.find((e) => e.type === "llm_call")!;
+    expect(llm.data["finish_reason"]).toBe("length");
+  });
+
+  it("sums usage over steps once per call and reports cached and reasoning tokens", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: JSON.parse(init!.body as string) });
+      return new Response("{}", { status: 202 });
+    });
+    agentping.init({
+      apiKey: VALID_KEY,
+      baseUrl: "https://api.example.com",
+      flushIntervalMs: 5,
+      batchSize: 10,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    const run = agentping.run("agent");
+    const helper = withAgentPing(run, { provider: "openai", model: "gpt-5-mini" });
+    helper.onFinish({
+      usage: { inputTokens: 20, outputTokens: 9 },
+      totalUsage: { inputTokens: 30, outputTokens: 13, cachedInputTokens: 12, reasoningTokens: 5 },
+      finishReason: "stop",
+      steps: [
+        { usage: { inputTokens: 10, outputTokens: 4 }, toolCalls: [{ toolName: "search", toolCallId: "c1" }] },
+        { usage: { inputTokens: 20, outputTokens: 9 } },
+      ],
+    });
+
+    await agentping.flush({ timeoutMs: 1_000 });
+
+    const eventCall = calls.find((c) => c.url.includes("/events"));
+    const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
+    const llms = body.events.filter((e) => e.type === "llm_call");
+    expect(llms).toHaveLength(1);
+    expect(llms[0]!.data["input_tokens"]).toBe(30);
+    expect(llms[0]!.data["output_tokens"]).toBe(13);
+    expect(llms[0]!.data["cached_input_tokens"]).toBe(12);
+    expect(llms[0]!.data["reasoning_tokens"]).toBe(5);
+    expect(llms[0]!.data["tool_calls"]).toBe(1);
+    expect(body.events.filter((e) => e.type === "tool_call")).toHaveLength(1);
   });
 
   it("perStep: true wires onStepFinish that emits per-step events", async () => {
@@ -158,17 +247,20 @@ describe("Vercel AI SDK helper", () => {
     const helper = withAgentPing(run, { provider: "openai", model: "gpt-4o", perStep: true });
     expect(helper.onStepFinish).toBeTypeOf("function");
 
-    helper.onStepFinish!({ usage: { inputTokens: 10, outputTokens: 4 } });
-    helper.onStepFinish!({ usage: { inputTokens: 20, outputTokens: 9 } });
+    helper.onStepFinish!({ usage: { inputTokens: 10, outputTokens: 4 }, finishReason: "tool-calls" });
+    helper.onStepFinish!({ usage: { inputTokens: 20, outputTokens: 9 }, finishReason: "stop" });
     helper.onFinish({ usage: { inputTokens: 30, outputTokens: 13 } });
 
     await agentping.flush({ timeoutMs: 1_000 });
 
     const eventBodies = calls
       .filter((c) => c.url.includes("/events"))
-      .flatMap((c) => (c.body as { events: Array<{ type: string }> }).events);
+      .flatMap((c) => (c.body as { events: Array<{ type: string; data: Record<string, unknown> }> }).events);
     const llms = eventBodies.filter((e) => e.type === "llm_call");
-    expect(llms).toHaveLength(3); // 2 steps + final
+    // One per step; onFinish stays silent so the tokens are never priced twice.
+    expect(llms).toHaveLength(2);
+    expect(llms.map((e) => e.data["input_tokens"])).toEqual([10, 20]);
+    expect(llms.map((e) => e.data["finish_reason"])).toEqual(["tool-calls", "stop"]);
   });
 
   it("auto-detects provider+model from response.modelId (provider/model format)", async () => {

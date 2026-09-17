@@ -1,6 +1,6 @@
 {
   "name": "@agentping/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AgentPing SDK for TypeScript and JavaScript. Production observability for AI agents.",
   "license": "MIT",
   "type": "module",

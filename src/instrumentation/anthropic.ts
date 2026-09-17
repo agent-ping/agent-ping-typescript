@@ -1,5 +1,12 @@
 import { wrapAsyncIterable } from "./streaming.js";
-import { getActiveRun } from "../context.js";
+import {
+  emitErroredLlmCall,
+  isPromiseLike,
+  putIfPositive,
+  putIfString,
+  resolveRun,
+  type InstrumentOptions,
+} from "./shared.js";
 
 interface AnthropicUsage {
   input_tokens?: number;
@@ -8,15 +15,23 @@ interface AnthropicUsage {
   cache_creation_input_tokens?: number;
 }
 
+interface AnthropicContentBlock {
+  type?: string;
+}
+
 interface AnthropicResponse {
   model?: string;
   usage?: AnthropicUsage;
+  stop_reason?: string | null;
+  content?: AnthropicContentBlock[];
 }
 
 interface AnthropicStreamChunk {
   type?: string;
   message?: { usage?: AnthropicUsage; model?: string };
   usage?: AnthropicUsage;
+  delta?: { stop_reason?: string | null };
+  content_block?: AnthropicContentBlock;
 }
 
 interface MessagesNamespace {
@@ -28,12 +43,12 @@ interface AnthropicClient {
   messages: MessagesNamespace;
 }
 
-interface RunLike {
-  event: (type: string, data: Record<string, unknown>) => void;
-}
-
-interface InstrumentOptions {
-  run?: RunLike;
+/** What a stream has told us so far; folded into one `llm_call` at the end. */
+interface StreamState {
+  model?: string;
+  usage: AnthropicUsage;
+  stopReason?: string;
+  toolCalls: number;
 }
 
 export function instrumentAnthropic<T extends AnthropicClient>(
@@ -100,11 +115,11 @@ function wrapResponsePromise(
   if (!isPromiseLike(result)) return result;
   return result.then(
     (response: unknown) => {
-      emitLlmCall(options, start, requestedModel, response as AnthropicResponse);
+      emitLlmCall(options, start, requestedModel, response as AnthropicResponse, false);
       return response;
     },
     (err: unknown) => {
-      emitFailure(options, start, requestedModel, err);
+      emitErroredLlmCall(options, "anthropic", requestedModel, start, err);
       throw err;
     },
   );
@@ -122,7 +137,7 @@ function wrapStreamPromise(
   return result.then(
     (stream: unknown) => wrapStreamResult(stream, options, start, requestedModel),
     (err: unknown) => {
-      emitFailure(options, start, requestedModel, err);
+      emitErroredLlmCall(options, "anthropic", requestedModel, start, err, { stream: true });
       throw err;
     },
   );
@@ -137,24 +152,32 @@ function wrapStreamResult(
   if (!stream || typeof stream !== "object") return stream;
   if (!(Symbol.asyncIterator in stream)) return stream;
 
-  const usage: AnthropicUsage = {};
-  let model: string | undefined = requestedModel;
+  const state: StreamState = { model: requestedModel, usage: {}, toolCalls: 0 };
 
   const observer = {
     onChunk(chunk: AnthropicStreamChunk): void {
       try {
-        if (chunk?.message?.model) model = chunk.message.model;
-        const u = chunk?.message?.usage ?? chunk?.usage;
-        if (u) mergeUsage(usage, u);
+        observeChunk(state, chunk);
       } catch {
         // swallow
       }
     },
     onDone(): void {
-      emitLlmCall(options, start, model, { model, usage });
+      emitLlmCall(
+        options,
+        start,
+        state.model,
+        {
+          model: state.model,
+          usage: state.usage,
+          stop_reason: state.stopReason,
+          content: Array.from({ length: state.toolCalls }, () => ({ type: "tool_use" })),
+        },
+        true,
+      );
     },
     onError(err: unknown): void {
-      emitFailure(options, start, model, err);
+      emitErroredLlmCall(options, "anthropic", state.model, start, err, { stream: true });
     },
   };
 
@@ -174,11 +197,26 @@ function wrapStreamResult(
   });
 }
 
+/**
+ * Fold one streaming event into the state. `message_start` carries the
+ * model and the input side of usage; `message_delta` carries the stop
+ * reason and a cumulative `output_tokens`, so the last value wins rather
+ * than being summed.
+ */
+function observeChunk(state: StreamState, chunk: AnthropicStreamChunk): void {
+  if (chunk?.message?.model) state.model = chunk.message.model;
+  const u = chunk?.message?.usage ?? chunk?.usage;
+  if (u) mergeUsage(state.usage, u);
+  const stopReason = chunk?.delta?.stop_reason;
+  if (typeof stopReason === "string") state.stopReason = stopReason;
+  if (chunk?.type === "content_block_start" && chunk.content_block?.type === "tool_use") {
+    state.toolCalls += 1;
+  }
+}
+
 function mergeUsage(into: AnthropicUsage, from: AnthropicUsage): void {
   if (from.input_tokens !== undefined) into.input_tokens = from.input_tokens;
-  if (from.output_tokens !== undefined) {
-    into.output_tokens = (into.output_tokens ?? 0) + from.output_tokens;
-  }
+  if (from.output_tokens !== undefined) into.output_tokens = from.output_tokens;
   if (from.cache_read_input_tokens !== undefined) {
     into.cache_read_input_tokens = from.cache_read_input_tokens;
   }
@@ -192,57 +230,33 @@ function emitLlmCall(
   start: number,
   requestedModel: string | undefined,
   response: AnthropicResponse,
+  stream: boolean,
 ): void {
-  const run = options.run ?? getActiveRun();
+  const run = resolveRun(options);
   if (!run) return;
   try {
     const latencyMs = Date.now() - start;
     const usage = response.usage ?? {};
     const model = response.model ?? requestedModel ?? "unknown";
+    const cached = usage.cache_read_input_tokens ?? 0;
+    const cacheCreation = usage.cache_creation_input_tokens ?? 0;
+    // Anthropic reports input_tokens net of cache reads and writes. Ingest
+    // prices from gross input, so add them back.
     const data: Record<string, unknown> = {
       provider: "anthropic",
       model,
-      input_tokens: usage.input_tokens ?? 0,
+      input_tokens: (usage.input_tokens ?? 0) + cached + cacheCreation,
       output_tokens: usage.output_tokens ?? 0,
       latency_ms: latencyMs,
     };
-    if (usage.cache_read_input_tokens !== undefined) {
-      data["cached_input_tokens"] = usage.cache_read_input_tokens;
-    }
-    if (usage.cache_creation_input_tokens !== undefined) {
-      data["cache_creation_input_tokens"] = usage.cache_creation_input_tokens;
-    }
+    putIfPositive(data, "cached_input_tokens", cached);
+    putIfPositive(data, "cache_creation_input_tokens", cacheCreation);
+    putIfString(data, "finish_reason", response.stop_reason);
+    const toolCalls = (response.content ?? []).filter((b) => b?.type === "tool_use").length;
+    if (toolCalls > 0) data["tool_calls"] = toolCalls;
+    if (stream) data["stream"] = true;
     run.event("llm_call", data);
   } catch {
     // swallow
   }
-}
-
-function emitFailure(
-  options: InstrumentOptions,
-  start: number,
-  model: string | undefined,
-  err: unknown,
-): void {
-  const run = options.run ?? getActiveRun();
-  if (!run) return;
-  try {
-    run.event("llm_call_error", {
-      provider: "anthropic",
-      model: model ?? "unknown",
-      latency_ms: Date.now() - start,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  } catch {
-    // swallow
-  }
-}
-
-function isPromiseLike<T = unknown>(value: unknown): value is PromiseLike<T> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "then" in value &&
-    typeof (value as { then: unknown }).then === "function"
-  );
 }

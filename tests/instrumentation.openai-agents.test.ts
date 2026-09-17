@@ -51,7 +51,7 @@ describe("AgentPingHooks (OpenAI Agents SDK)", () => {
     expect(llm.data["latency_ms"]).toBeTypeOf("number");
   });
 
-  it("onToolStart emits tool_call event", async () => {
+  it("emits one tool_call when a tool finishes, joined to its start by callId", async () => {
     const calls: Array<{ url: string; body: unknown }> = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       calls.push({ url, body: JSON.parse(init!.body as string) });
@@ -67,17 +67,87 @@ describe("AgentPingHooks (OpenAI Agents SDK)", () => {
 
     const run = agentping.run("triage");
     const hooks = new AgentPingHooks(run);
-    await hooks.onToolStart({}, { name: "Triage" }, { name: "fetch_orders" });
+    const ctx = {};
+    const agent = { name: "Triage" };
+    const tool = { name: "fetch_orders" };
+    const details = {
+      toolCall: { type: "function_call", callId: "call_42", name: "fetch_orders", arguments: '{"customer":"c_1"}' },
+    };
+
+    await hooks.onToolStart(ctx, agent, tool, details);
+    await hooks.onToolEnd(ctx, agent, tool, '{"orders":2}', details);
 
     await agentping.flush({ timeoutMs: 1_000 });
 
     const eventCall = calls.find((c) => c.url.includes("/events"));
     const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
-    const tool = body.events.find((e) => e.type === "tool_call")!;
-    expect(tool.data["tool"]).toBe("fetch_orders");
+    const toolCalls = body.events.filter((e) => e.type === "tool_call");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0]!.data["tool"]).toBe("fetch_orders");
+    expect(toolCalls[0]!.data["status"]).toBe("success");
+    expect(toolCalls[0]!.data["tool_invocation_id"]).toBe("call_42");
+    expect(toolCalls[0]!.data["input"]).toBe('{"customer":"c_1"}');
+    expect(toolCalls[0]!.data["output"]).toBe('{"orders":2}');
+    expect(toolCalls[0]!.data["latency_ms"]).toBeTypeOf("number");
   });
 
-  it("onHandoff emits handoff event with agent names", async () => {
+  it("attach subscribes to a Runner-style emitter", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: JSON.parse(init!.body as string) });
+      return new Response("{}", { status: 202 });
+    });
+    agentping.init({
+      apiKey: VALID_KEY,
+      baseUrl: "https://api.example.com",
+      flushIntervalMs: 5,
+      batchSize: 10,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const runner = {
+      on(event: string, listener: (...args: unknown[]) => void) {
+        listeners.set(event, listener);
+        return runner;
+      },
+    };
+
+    const run = agentping.run("triage");
+    new AgentPingHooks(run, { captureToolPayloads: false }).attach(runner);
+    expect([...listeners.keys()].sort()).toEqual([
+      "agent_end",
+      "agent_handoff",
+      "agent_start",
+      "agent_tool_end",
+      "agent_tool_start",
+    ]);
+
+    const ctx = {};
+    const triage = { name: "Triage", model: "gpt-4o-mini" };
+    const billing = { name: "Billing", model: "gpt-4o-mini" };
+    const details = { toolCall: { callId: "call_1", name: "lookup", arguments: "{}" } };
+    listeners.get("agent_start")!(ctx, triage);
+    listeners.get("agent_tool_start")!(ctx, triage, { name: "lookup" }, details);
+    listeners.get("agent_tool_end")!(ctx, triage, { name: "lookup" }, "found", details);
+    listeners.get("agent_handoff")!(ctx, triage, billing);
+    listeners.get("agent_end")!(ctx, billing, "done");
+
+    await agentping.flush({ timeoutMs: 1_000 });
+
+    const eventCall = calls.find((c) => c.url.includes("/events"));
+    const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
+    const types = body.events.map((e) => e.type);
+    expect(types).toEqual(["tool_call", "step", "step"]);
+    const tool = body.events[0]!;
+    expect(tool.data["tool"]).toBe("lookup");
+    expect("input" in tool.data).toBe(false);
+    expect("output" in tool.data).toBe(false);
+    expect(body.events[1]!.data).toMatchObject({ kind: "handoff", from: "Triage", to: "Billing" });
+    expect(body.events[2]!.data).toMatchObject({ kind: "agent", agent: "Billing" });
+  });
+
+  it("onHandoff emits a handoff step with agent names", async () => {
     const calls: Array<{ url: string; body: unknown }> = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       calls.push({ url, body: JSON.parse(init!.body as string) });
@@ -99,7 +169,8 @@ describe("AgentPingHooks (OpenAI Agents SDK)", () => {
 
     const eventCall = calls.find((c) => c.url.includes("/events"));
     const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
-    const handoff = body.events.find((e) => e.type === "handoff")!;
+    const handoff = body.events.find((e) => e.type === "step")!;
+    expect(handoff.data["kind"]).toBe("handoff");
     expect(handoff.data["from"]).toBe("Triage");
     expect(handoff.data["to"]).toBe("Billing");
   });

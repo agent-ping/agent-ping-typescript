@@ -73,7 +73,7 @@ describe("instrumentBedrock", () => {
     expect(llm.data["latency_ms"]).toBeTypeOf("number");
   });
 
-  it("ConverseCommand splits cache_read into cached_input_tokens", async () => {
+  it("ConverseCommand reports gross input plus the cached split", async () => {
     const calls: Array<{ url: string; body: unknown }> = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       calls.push({ url, body: JSON.parse(init!.body as string) });
@@ -90,6 +90,13 @@ describe("instrumentBedrock", () => {
     const fakeClient = {
       send: vi.fn(async (_command: unknown) => ({
         usage: { inputTokens: 1000, outputTokens: 100, cacheReadInputTokens: 400 },
+        stopReason: "tool_use",
+        output: {
+          message: {
+            role: "assistant",
+            content: [{ text: "Checking." }, { toolUse: { toolUseId: "t1", name: "lookup", input: {} } }],
+          },
+        },
       })),
     };
 
@@ -101,9 +108,12 @@ describe("instrumentBedrock", () => {
     const eventCall = calls.find((c) => c.url.includes("/events"));
     const body = eventCall!.body as { events: Array<{ type: string; data: Record<string, unknown> }> };
     const llm = body.events.find((e) => e.type === "llm_call")!;
-    expect(llm.data["input_tokens"]).toBe(600); // 1000 - 400 cached
+    // Converse's inputTokens excludes cache reads (Anthropic semantics); ingest wants gross.
+    expect(llm.data["input_tokens"]).toBe(1400);
     expect(llm.data["cached_input_tokens"]).toBe(400);
     expect(llm.data["output_tokens"]).toBe(100);
+    expect(llm.data["finish_reason"]).toBe("tool_use");
+    expect(llm.data["tool_calls"]).toBe(1);
   });
 
   it("InvokeModelCommand reads token counts from $metadata.httpHeaders", async () => {

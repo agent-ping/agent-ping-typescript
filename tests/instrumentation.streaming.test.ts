@@ -76,9 +76,10 @@ describe("TypeScript provider streaming + embed", () => {
     const llm = body.events.find((e) => e.type === "llm_call")!;
     expect(llm.data["provider"]).toBe("gemini");
     expect(llm.data["model"]).toBe("gemini-2.0-flash");
-    expect(llm.data["input_tokens"]).toBe(150); // 250 - 100 cached
+    expect(llm.data["input_tokens"]).toBe(250); // promptTokenCount is already gross
     expect(llm.data["cached_input_tokens"]).toBe(100);
     expect(llm.data["output_tokens"]).toBe(90);
+    expect(llm.data["stream"]).toBe(true);
   });
 
   it("instrumentGemini wraps embedContent and emits kind: embedding event", async () => {

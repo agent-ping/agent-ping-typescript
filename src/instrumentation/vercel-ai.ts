@@ -3,8 +3,7 @@
  *
  * The AI SDK doesn't expose a single client object to wrap, but every
  * `generateText` and `streamText` accepts an `onFinish` callback (and
- * `onStepFinish` for tool-using agents) that fires once with the final
- * usage block. This module exposes two helpers:
+ * `onStepFinish` for tool-using agents). This module exposes two helpers:
  *
  * - `withAgentPing(run, options?)` - returns a partial options object you
  *   can spread into `generateText` / `streamText` calls. It populates
@@ -14,7 +13,24 @@
  *
  * - `agentPingOnFinish(run, options?)` - returns just the `onFinish`
  *   callback for cases where you want to compose with your own handlers.
+ *
+ * By default one `llm_call` is emitted per `generateText` / `streamText`
+ * call with the usage summed across steps, followed by one `tool_call`
+ * per tool the model used. With `perStep: true` each model step becomes
+ * its own `llm_call` (with its tool calls after it) and `onFinish` emits
+ * nothing, so tokens are never priced twice.
  */
+
+import { getActiveRun } from "../context.js";
+import {
+  DEFAULT_TOOL_PAYLOAD_MAX_CHARS,
+  errorFields,
+  putIfPositive,
+  putIfString,
+  stringifyPayload,
+  type RunLike,
+  type ToolPayloadOptions,
+} from "./shared.js";
 
 interface AISDKUsage {
   promptTokens?: number;
@@ -24,12 +40,31 @@ interface AISDKUsage {
   inputTokens?: number;
   outputTokens?: number;
   cachedInputTokens?: number;
+  reasoningTokens?: number;
 }
 
 interface AISDKToolCall {
   toolName?: string;
   toolCallId?: string;
+  /** AI SDK v5. */
+  input?: unknown;
+  /** AI SDK v4. */
   args?: unknown;
+}
+
+interface AISDKToolResult extends AISDKToolCall {
+  /** AI SDK v5. */
+  output?: unknown;
+  /** AI SDK v4. */
+  result?: unknown;
+}
+
+/** AI SDK v5 step content part; only tool errors are read here. */
+interface AISDKContentPart {
+  type?: string;
+  toolCallId?: string;
+  toolName?: string;
+  error?: unknown;
 }
 
 /** Shape exposed by AI SDK v5 onFinish responses. */
@@ -38,37 +73,32 @@ interface AISDKResponseMetadata {
   providerMetadata?: Record<string, unknown>;
 }
 
-interface OnFinishPayload {
+interface StepLike {
   usage?: AISDKUsage;
   finishReason?: string;
+  toolCalls?: AISDKToolCall[];
+  toolResults?: AISDKToolResult[];
+  content?: AISDKContentPart[];
+  response?: AISDKResponseMetadata;
+  model?: unknown;
+}
+
+interface OnFinishPayload extends StepLike {
   text?: string;
-  toolCalls?: AISDKToolCall[];
-  // AI SDK v5+ surfaces response metadata here.
-  response?: AISDKResponseMetadata;
-  // Some flows also pass the model object directly.
-  model?: unknown;
+  /** AI SDK v5: usage summed over every step. */
+  totalUsage?: AISDKUsage;
+  /** AI SDK v5: one entry per model step. */
+  steps?: StepLike[];
 }
 
-interface OnStepFinishPayload {
-  usage?: AISDKUsage;
-  finishReason?: string;
-  toolCalls?: AISDKToolCall[];
-  response?: AISDKResponseMetadata;
-  model?: unknown;
-}
+type OnStepFinishPayload = StepLike;
 
-import { getActiveRun } from "../context.js";
-
-interface RunLike {
-  event: (type: string, data: Record<string, unknown>) => void;
-}
-
-interface WithAgentPingOptions {
+interface WithAgentPingOptions extends ToolPayloadOptions {
   /** Optional provider override. Auto-detected from response.modelId or the model object when omitted. */
   provider?: string;
   /** Optional model override. Auto-detected from response.modelId when omitted. */
   model?: string;
-  /** Set to true to emit per-step events for tool-using agents. Defaults to false. */
+  /** Emit one `llm_call` per model step instead of one per call. Defaults to false. */
   perStep?: boolean;
 }
 
@@ -81,8 +111,8 @@ export function withAgentPing(
   runOrOptions?: RunLike | WithAgentPingOptions,
   maybeOptions: WithAgentPingOptions = {},
 ): AgentPingAISDKOptions {
-  // Support both `withAgentPing(run, options?)` and `withAgentPing(options?)`
-  // — the latter resolves the run from the active AsyncLocalStorage scope.
+  // Support both `withAgentPing(run, options?)` and `withAgentPing(options?)`;
+  // the latter resolves the run from the active AsyncLocalStorage scope.
   const explicitRun: RunLike | undefined =
     runOrOptions && typeof (runOrOptions as RunLike).event === "function"
       ? (runOrOptions as RunLike)
@@ -96,16 +126,20 @@ export function withAgentPing(
   const resolveRun = (): RunLike | undefined => explicitRun ?? getActiveRun();
 
   const onFinish = (event: OnFinishPayload): void => {
+    // Per-step mode already reported every step as it finished.
+    if (options.perStep) return;
     const run = resolveRun();
     if (!run) return;
     const { provider, model } = resolveProviderModel(event, options);
-    emitLlmCall(run, provider, model, start, event.usage, event.toolCalls);
-    if (event.finishReason && event.finishReason !== "stop") {
-      try {
-        run.event("finish_reason", { provider, reason: event.finishReason });
-      } catch {
-        // swallow
-      }
+    const steps = event.steps ?? [];
+    emitLlmCall(run, provider, model, start, event.totalUsage ?? event.usage, {
+      finishReason: event.finishReason,
+      toolCalls: steps.length > 0 ? sum(steps, (s) => s.toolCalls?.length ?? 0) : event.toolCalls?.length ?? 0,
+    });
+    if (steps.length > 0) {
+      for (const step of steps) emitToolCalls(run, step, options);
+    } else {
+      emitToolCalls(run, event, options);
     }
   };
 
@@ -117,7 +151,11 @@ export function withAgentPing(
       const run = resolveRun();
       if (!run) return;
       const { provider, model } = resolveProviderModel(event, options);
-      emitLlmCall(run, provider, model, stepStart, event.usage, event.toolCalls);
+      emitLlmCall(run, provider, model, stepStart, event.usage, {
+        finishReason: event.finishReason,
+        toolCalls: event.toolCalls?.length ?? 0,
+      });
+      emitToolCalls(run, event, options);
       stepStart = Date.now();
     };
   }
@@ -142,7 +180,7 @@ export function agentPingOnFinish(
  * explicit user overrides.
  */
 function resolveProviderModel(
-  event: OnFinishPayload | OnStepFinishPayload,
+  event: StepLike,
   overrides: WithAgentPingOptions,
 ): { provider: string; model: string } {
   if (overrides.provider && overrides.model) {
@@ -179,42 +217,80 @@ function resolveProviderModel(
   };
 }
 
+function sum<T>(items: T[], pick: (item: T) => number): number {
+  return items.reduce((total, item) => total + pick(item), 0);
+}
+
 function emitLlmCall(
   run: RunLike,
   provider: string,
   model: string,
   start: number,
   usage: AISDKUsage | undefined,
-  toolCalls: AISDKToolCall[] | undefined,
+  info: { finishReason?: string; toolCalls: number },
 ): void {
-  if (!run) return;
   try {
     const latencyMs = Date.now() - start;
-    const input = usage?.inputTokens ?? usage?.promptTokens ?? 0;
-    const output = usage?.outputTokens ?? usage?.completionTokens ?? 0;
-    const cached = usage?.cachedInputTokens ?? 0;
-
+    // AI SDK v5 reports inputTokens gross, with cachedInputTokens as the
+    // cached subset; ingest prices from the gross figure.
     const data: Record<string, unknown> = {
       provider,
       model,
-      input_tokens: cached > 0 ? Math.max(0, input - cached) : input,
-      output_tokens: output,
+      input_tokens: usage?.inputTokens ?? usage?.promptTokens ?? 0,
+      output_tokens: usage?.outputTokens ?? usage?.completionTokens ?? 0,
       latency_ms: latencyMs,
     };
-    if (cached > 0) {
-      data["cached_input_tokens"] = cached;
-    }
+    putIfPositive(data, "cached_input_tokens", usage?.cachedInputTokens);
+    putIfPositive(data, "reasoning_tokens", usage?.reasoningTokens);
+    putIfString(data, "finish_reason", info.finishReason);
+    if (info.toolCalls > 0) data["tool_calls"] = info.toolCalls;
     run.event("llm_call", data);
-
-    if (toolCalls && toolCalls.length > 0) {
-      for (const call of toolCalls) {
-        run.event("tool_call", {
-          tool: call.toolName ?? "unknown",
-          tool_call_id: call.toolCallId,
-        });
-      }
-    }
   } catch {
     // swallow
+  }
+}
+
+/**
+ * One `tool_call` per tool the step invoked, joined to its result (or
+ * error) by `toolCallId`. The AI SDK runs tools itself and does not expose
+ * per-tool timing, so there is no `latency_ms`.
+ */
+function emitToolCalls(run: RunLike, step: StepLike, options: ToolPayloadOptions): void {
+  const calls = step.toolCalls ?? [];
+  if (calls.length === 0) return;
+  const capture = options.captureToolPayloads ?? true;
+  const maxChars = options.toolPayloadMaxChars ?? DEFAULT_TOOL_PAYLOAD_MAX_CHARS;
+  const results = new Map<string, AISDKToolResult>();
+  for (const result of step.toolResults ?? []) {
+    if (result.toolCallId) results.set(result.toolCallId, result);
+  }
+  const errors = new Map<string, unknown>();
+  for (const part of step.content ?? []) {
+    if (part?.type === "tool-error" && part.toolCallId) errors.set(part.toolCallId, part.error);
+  }
+
+  for (const call of calls) {
+    try {
+      const id = call.toolCallId;
+      const data: Record<string, unknown> = {
+        tool: call.toolName ?? "unknown",
+        status: "success",
+      };
+      putIfString(data, "tool_invocation_id", id);
+      const input = call.input ?? call.args;
+      if (capture && input !== undefined) data["input"] = stringifyPayload(input, maxChars);
+
+      if (id && errors.has(id)) {
+        data["status"] = "error";
+        Object.assign(data, errorFields(errors.get(id)));
+      } else {
+        const result = id ? results.get(id) : undefined;
+        const output = result?.output ?? result?.result;
+        if (capture && output !== undefined) data["output"] = stringifyPayload(output, maxChars);
+      }
+      run.event("tool_call", data);
+    } catch {
+      // swallow
+    }
   }
 }
