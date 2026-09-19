@@ -77,7 +77,15 @@ export class Run {
     state.worker.notifyEnqueued();
   }
 
-  event(type: string, data: Record<string, unknown> = {}): void {
+  /**
+   * Append an event to the run.
+   *
+   * @param turn Which exchange of a conversation this belongs to, counting from
+   *   1. One turn is often several events -- call the model, run a tool, call it
+   *   again -- and this is what groups them. Omit for work that is not a
+   *   conversation.
+   */
+  event(type: string, data: Record<string, unknown> = {}, turn?: number): void {
     try {
       if (this.finished) {
         warnOnce(
@@ -92,6 +100,7 @@ export class Run {
         ts: new Date().toISOString(),
         data,
       };
+      if (turn !== undefined) event["turn"] = turn;
       this.state.queue.push({
         kind: "run_events",
         runId: this.id,
