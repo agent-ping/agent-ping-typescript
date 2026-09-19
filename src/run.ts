@@ -12,6 +12,23 @@ export interface RunStartOptions {
    * without it the review has little to judge against.
    */
   goal?: string;
+  /**
+   * Close the run automatically once no event has arrived for this long
+   * (60-86400). For callers that cannot be relied on to send finish: a browser
+   * that gets closed, a process that gets killed. Also makes the run resumable --
+   * a later event reopens it. See conversation().
+   */
+  idleTimeoutSeconds?: number;
+  /**
+   * What that silence meant. Defaults server-side to "timeout": we stopped
+   * waiting, we do not know how it went. A chat should send "success".
+   */
+  idleTimeoutStatus?: "success" | "failed" | "timeout" | "cancelled";
+  /**
+   * Reuse a known run id and start time instead of minting new ones, so a
+   * stateless backend can re-open the same conversation on a later request.
+   */
+  resume?: { id: string; startedAt: string };
 }
 
 export interface RunFinishOptions {
@@ -32,9 +49,9 @@ export class Run {
     agent: string,
     options: RunStartOptions = {},
   ) {
-    this.id = newId("run", state.region);
+    this.id = options.resume?.id ?? newId("run", state.region);
     this.agent = agent;
-    this.startedAt = new Date().toISOString();
+    this.startedAt = options.resume?.startedAt ?? new Date().toISOString();
 
     const body: Record<string, unknown> = {
       id: this.id,
@@ -45,6 +62,10 @@ export class Run {
     if (options.feature) body["feature"] = options.feature;
     if (options.goal) body["goal"] = options.goal;
     if (options.metadata) body["metadata"] = options.metadata;
+    if (options.idleTimeoutSeconds !== undefined) {
+      body["idle_timeout_seconds"] = options.idleTimeoutSeconds;
+      if (options.idleTimeoutStatus) body["idle_timeout_status"] = options.idleTimeoutStatus;
+    }
     const parent =
       options.parentRunId ??
       (typeof process !== "undefined"
