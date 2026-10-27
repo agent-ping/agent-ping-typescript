@@ -1,7 +1,10 @@
 import { wrapAsyncIterable } from "./streaming.js";
 import {
+  FirstChunkClock,
+  contentCaptureEnabled,
   emitErroredLlmCall,
   isPromiseLike,
+  putContent,
   putIfPositive,
   putIfString,
   resolveRun,
@@ -17,6 +20,15 @@ interface AnthropicUsage {
 
 interface AnthropicContentBlock {
   type?: string;
+  text?: string;
+}
+
+/** The request fields capture reads. */
+interface AnthropicRequest {
+  stream?: boolean;
+  model?: string;
+  messages?: unknown;
+  system?: unknown;
 }
 
 interface AnthropicResponse {
@@ -30,7 +42,7 @@ interface AnthropicStreamChunk {
   type?: string;
   message?: { usage?: AnthropicUsage; model?: string };
   usage?: AnthropicUsage;
-  delta?: { stop_reason?: string | null };
+  delta?: { stop_reason?: string | null; type?: string; text?: string };
   content_block?: AnthropicContentBlock;
 }
 
@@ -49,6 +61,16 @@ interface StreamState {
   usage: AnthropicUsage;
   stopReason?: string;
   toolCalls: number;
+  clock: FirstChunkClock;
+  text: string[];
+  capture: boolean;
+}
+
+/** Fields that ride along with the usage: request for capture, stream timing and text. */
+interface CallExtras {
+  request?: AnthropicRequest;
+  ttftMs?: number;
+  outputText?: string;
 }
 
 export function instrumentAnthropic<T extends AnthropicClient>(
@@ -64,7 +86,7 @@ export function instrumentAnthropic<T extends AnthropicClient>(
 
   const wrappedCreate = (...args: unknown[]): unknown => {
     const start = Date.now();
-    const firstArg = args[0] as { stream?: boolean; model?: string } | undefined;
+    const firstArg = args[0] as AnthropicRequest | undefined;
     const isStream = Boolean(firstArg?.stream);
     let result: unknown;
     try {
@@ -74,17 +96,17 @@ export function instrumentAnthropic<T extends AnthropicClient>(
       throw err;
     }
     if (isStream) {
-      return wrapStreamPromise(result, options, start, firstArg?.model);
+      return wrapStreamPromise(result, options, start, firstArg);
     }
-    return wrapResponsePromise(result, options, start, firstArg?.model);
+    return wrapResponsePromise(result, options, start, firstArg);
   };
 
   const wrappedStream = originalStream
     ? (...args: unknown[]): unknown => {
         const start = Date.now();
-        const firstArg = args[0] as { model?: string } | undefined;
+        const firstArg = args[0] as AnthropicRequest | undefined;
         const result = originalStream(...args);
-        return wrapStreamResult(result, options, start, firstArg?.model);
+        return wrapStreamResult(result, options, start, firstArg);
       }
     : undefined;
 
@@ -110,16 +132,20 @@ function wrapResponsePromise(
   result: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: AnthropicRequest | undefined,
 ): unknown {
   if (!isPromiseLike(result)) return result;
   return result.then(
     (response: unknown) => {
-      emitLlmCall(options, start, requestedModel, response as AnthropicResponse, false);
+      const typed = response as AnthropicResponse;
+      emitLlmCall(options, start, request?.model, typed, false, {
+        request,
+        outputText: textOf(typed.content),
+      });
       return response;
     },
     (err: unknown) => {
-      emitErroredLlmCall(options, "anthropic", requestedModel, start, err);
+      emitErroredLlmCall(options, "anthropic", request?.model, start, err);
       throw err;
     },
   );
@@ -129,15 +155,15 @@ function wrapStreamPromise(
   result: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: AnthropicRequest | undefined,
 ): unknown {
   if (!isPromiseLike(result)) {
-    return wrapStreamResult(result, options, start, requestedModel);
+    return wrapStreamResult(result, options, start, request);
   }
   return result.then(
-    (stream: unknown) => wrapStreamResult(stream, options, start, requestedModel),
+    (stream: unknown) => wrapStreamResult(stream, options, start, request),
     (err: unknown) => {
-      emitErroredLlmCall(options, "anthropic", requestedModel, start, err, { stream: true });
+      emitErroredLlmCall(options, "anthropic", request?.model, start, err, { stream: true });
       throw err;
     },
   );
@@ -147,12 +173,19 @@ function wrapStreamResult(
   stream: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: AnthropicRequest | undefined,
 ): unknown {
   if (!stream || typeof stream !== "object") return stream;
   if (!(Symbol.asyncIterator in stream)) return stream;
 
-  const state: StreamState = { model: requestedModel, usage: {}, toolCalls: 0 };
+  const state: StreamState = {
+    model: request?.model,
+    usage: {},
+    toolCalls: 0,
+    clock: new FirstChunkClock(),
+    text: [],
+    capture: contentCaptureEnabled(),
+  };
 
   const observer = {
     onChunk(chunk: AnthropicStreamChunk): void {
@@ -174,6 +207,7 @@ function wrapStreamResult(
           content: Array.from({ length: state.toolCalls }, () => ({ type: "tool_use" })),
         },
         true,
+        { request, ttftMs: state.clock.ttftMs(start), outputText: state.text.join("") },
       );
     },
     onError(err: unknown): void {
@@ -204,6 +238,17 @@ function wrapStreamResult(
  * than being summed.
  */
 function observeChunk(state: StreamState, chunk: AnthropicStreamChunk): void {
+  if (chunk?.type === "content_block_start" || chunk?.type === "content_block_delta") {
+    state.clock.mark();
+  }
+  if (
+    state.capture &&
+    chunk?.type === "content_block_delta" &&
+    (chunk.delta?.type ?? "text_delta") === "text_delta" &&
+    typeof chunk.delta?.text === "string"
+  ) {
+    state.text.push(chunk.delta.text);
+  }
   if (chunk?.message?.model) state.model = chunk.message.model;
   const u = chunk?.message?.usage ?? chunk?.usage;
   if (u) mergeUsage(state.usage, u);
@@ -225,12 +270,21 @@ function mergeUsage(into: AnthropicUsage, from: AnthropicUsage): void {
   }
 }
 
+/** The text blocks of a response's content, joined. */
+function textOf(content: AnthropicContentBlock[] | undefined): string {
+  return (content ?? [])
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text as string)
+    .join("");
+}
+
 function emitLlmCall(
   options: InstrumentOptions,
   start: number,
   requestedModel: string | undefined,
   response: AnthropicResponse,
   stream: boolean,
+  extras: CallExtras = {},
 ): void {
   const run = resolveRun(options);
   if (!run) return;
@@ -255,6 +309,12 @@ function emitLlmCall(
     const toolCalls = (response.content ?? []).filter((b) => b?.type === "tool_use").length;
     if (toolCalls > 0) data["tool_calls"] = toolCalls;
     if (stream) data["stream"] = true;
+    if (extras.ttftMs !== undefined) data["ttft_ms"] = extras.ttftMs;
+    putContent(data, {
+      input: extras.request?.messages,
+      system: extras.request?.system,
+      output: extras.outputText,
+    });
     run.event("llm_call", data);
   } catch {
     // swallow

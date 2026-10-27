@@ -89,6 +89,23 @@ not against one run that passes the check and then loops forever. Drop
 `guard.check(...)` at several points to turn it into a series of gates.
 Thresholds are set in USD.
 
+## Run options
+
+```ts
+agentping.init({ apiKey, version: "2026.10.27" }); // default for every run
+const run = agentping.run("support-triage", {
+  customerId: "cust_123",
+  feature: "routing",
+  goal: "Answer the ticket",
+  version: "prompt-v7", // per-run override
+});
+```
+
+`version` is the build or prompt version that produced the run. The Spend and
+Verify charts mark the bucket where each agent's new version was first seen, so
+a cost or score shift reads against the deploy that preceded it.
+`AGENTPING_VERSION` sets the default without code.
+
 ## Auto-instrumentation
 
 Wrap a provider client to capture `llm_call` events automatically. No
@@ -155,6 +172,13 @@ keep payloads out of AgentPing.
 
 Per-integration docs:
 [Anthropic](https://agentping.io/docs/providers/anthropic) ·
+
+Prompt and completion text are off by default. Turn them on with
+`agentping.init({ captureLlmContent: true })` and `instrumentAnthropic` and
+`instrumentOpenAI` add `input` (a list of `{role, content}` messages), `output`
+and `system_instructions` to each `llm_call`, each clipped at
+`llmContentMaxChars` (default 4000). The run page shows them as messages.
+Streamed calls also report `ttft_ms`, the time to the first content chunk.
 [OpenAI](https://agentping.io/docs/providers/openai) ·
 [Gemini](https://agentping.io/docs/providers/gemini) ·
 [Mistral](https://agentping.io/docs/providers/mistral) ·

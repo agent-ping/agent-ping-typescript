@@ -41,7 +41,7 @@ export class HttpClient {
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${this.apiKey}`,
-          "user-agent": "agentping-ts/0.1",
+          "user-agent": "agentping-ts/0.3",
         },
         body: JSON.stringify(payload),
         signal: controller.signal,
@@ -127,7 +127,7 @@ export class HttpClient {
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${this.apiKey}`,
-          "user-agent": "agentping-ts/0.1",
+          "user-agent": "agentping-ts/0.3",
         },
         body: JSON.stringify(payload),
         signal: controller.signal,

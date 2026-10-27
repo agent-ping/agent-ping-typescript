@@ -1,5 +1,8 @@
 import { wrapAsyncIterable } from "./streaming.js";
 import {
+  putContent,
+  contentCaptureEnabled,
+  FirstChunkClock,
   emitErroredLlmCall,
   isPromiseLike,
   putIfPositive,
@@ -25,8 +28,17 @@ interface OpenAIToolCall {
 
 interface OpenAIChoice {
   finish_reason?: string | null;
-  message?: { tool_calls?: OpenAIToolCall[] };
-  delta?: { tool_calls?: OpenAIToolCall[] };
+  message?: { tool_calls?: OpenAIToolCall[]; content?: string | null };
+  delta?: { tool_calls?: OpenAIToolCall[]; content?: string | null };
+}
+
+/** The request fields capture reads, across both APIs. */
+interface OpenAIRequest {
+  stream?: boolean;
+  model?: string;
+  messages?: unknown;
+  input?: unknown;
+  instructions?: unknown;
 }
 
 interface OpenAIResponse {
@@ -61,6 +73,7 @@ interface ResponsesResponse {
   output?: ResponsesOutputItem[];
   status?: string;
   incomplete_details?: { reason?: string } | null;
+  output_text?: string;
 }
 
 interface ResponsesStreamEvent {
@@ -91,6 +104,10 @@ interface CallSummary {
   reasoningTokens: number;
   finishReason?: string;
   toolCalls: number;
+  /** Assistant text, when capture is on. */
+  outputText?: string;
+  /** Streams: request start to first content chunk. */
+  ttftMs?: number;
 }
 
 /**
@@ -153,6 +170,7 @@ type Summarise<R> = (response: R, requestedModel: string | undefined) => CallSum
 type StreamSummariser<C> = () => {
   onChunk: (chunk: C) => void;
   summary: (requestedModel: string | undefined) => CallSummary;
+  clock: FirstChunkClock;
 };
 
 function wrapCreate<R, C>(
@@ -165,13 +183,13 @@ function wrapCreate<R, C>(
 
   return (...args: unknown[]): unknown => {
     const start = Date.now();
-    const firstArg = args[0] as { stream?: boolean; model?: string } | undefined;
+    const firstArg = args[0] as OpenAIRequest | undefined;
     const isStream = Boolean(firstArg?.stream);
     const result = originalCreate(...args);
     if (isStream) {
-      return wrapStreamPromise(result, options, start, firstArg?.model, streamSummariser);
+      return wrapStreamPromise(result, options, start, firstArg, streamSummariser);
     }
-    return wrapResponsePromise(result, options, start, firstArg?.model, summarise);
+    return wrapResponsePromise(result, options, start, firstArg, summarise);
   };
 }
 
@@ -179,17 +197,17 @@ function wrapResponsePromise<R>(
   result: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: OpenAIRequest | undefined,
   summarise: Summarise<R>,
 ): unknown {
   if (!isPromiseLike(result)) return result;
   return result.then(
     (response: unknown) => {
-      emitLlmCall(options, start, summarise(response as R, requestedModel), false);
+      emitLlmCall(options, start, summarise(response as R, request?.model), false, request);
       return response;
     },
     (err: unknown) => {
-      emitErroredLlmCall(options, "openai", requestedModel, start, err);
+      emitErroredLlmCall(options, "openai", request?.model, start, err);
       throw err;
     },
   );
@@ -199,17 +217,16 @@ function wrapStreamPromise<C>(
   result: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: OpenAIRequest | undefined,
   streamSummariser: StreamSummariser<C>,
 ): unknown {
   if (!isPromiseLike(result)) {
-    return wrapStreamResult(result, options, start, requestedModel, streamSummariser);
+    return wrapStreamResult(result, options, start, request, streamSummariser);
   }
   return result.then(
-    (stream: unknown) =>
-      wrapStreamResult(stream, options, start, requestedModel, streamSummariser),
+    (stream: unknown) => wrapStreamResult(stream, options, start, request, streamSummariser),
     (err: unknown) => {
-      emitErroredLlmCall(options, "openai", requestedModel, start, err, { stream: true });
+      emitErroredLlmCall(options, "openai", request?.model, start, err, { stream: true });
       throw err;
     },
   );
@@ -219,12 +236,13 @@ function wrapStreamResult<C>(
   stream: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: OpenAIRequest | undefined,
   streamSummariser: StreamSummariser<C>,
 ): unknown {
   if (!stream || typeof stream !== "object") return stream;
   if (!(Symbol.asyncIterator in stream)) return stream;
 
+  const requestedModel = request?.model;
   const collector = streamSummariser();
 
   const observer = {
@@ -236,7 +254,9 @@ function wrapStreamResult<C>(
       }
     },
     onDone(): void {
-      emitLlmCall(options, start, collector.summary(requestedModel), true);
+      const summary = collector.summary(requestedModel);
+      summary.ttftMs = collector.clock.ttftMs(start);
+      emitLlmCall(options, start, summary, true, request);
     },
     onError(err: unknown): void {
       const model = collector.summary(requestedModel).model;
@@ -270,6 +290,7 @@ function chatSummary(response: OpenAIResponse, requestedModel: string | undefine
     reasoningTokens: usage.completion_tokens_details?.reasoning_tokens ?? 0,
     finishReason: choice?.finish_reason ?? undefined,
     toolCalls: choice?.message?.tool_calls?.length ?? 0,
+    outputText: typeof choice?.message?.content === "string" ? choice.message.content : undefined,
   };
 }
 
@@ -279,13 +300,23 @@ function chatStreamSummary(): ReturnType<StreamSummariser<OpenAIStreamChunk>> {
   let finishReason: string | undefined;
   // Tool calls stream as deltas keyed by index; count distinct indexes.
   const toolCallIndexes = new Set<number>();
+  const clock = new FirstChunkClock();
+  const capture = contentCaptureEnabled();
+  const text: string[] = [];
   return {
+    clock,
     onChunk(chunk) {
       if (chunk?.model) model = chunk.model;
       // Usage arrives on the final chunk when stream_options.include_usage is set.
       if (chunk?.usage) usage = chunk.usage;
       const choice = chunk?.choices?.[0];
       if (choice?.finish_reason) finishReason = choice.finish_reason;
+      const content = choice?.delta?.content;
+      if (typeof content === "string" && content.length > 0) {
+        clock.mark();
+        if (capture) text.push(content);
+      }
+      if ((choice?.delta?.tool_calls ?? []).length > 0) clock.mark();
       for (const call of choice?.delta?.tool_calls ?? []) {
         toolCallIndexes.add(call.index ?? toolCallIndexes.size);
       }
@@ -299,6 +330,7 @@ function chatStreamSummary(): ReturnType<StreamSummariser<OpenAIStreamChunk>> {
         reasoningTokens: usage?.completion_tokens_details?.reasoning_tokens ?? 0,
         finishReason,
         toolCalls: toolCallIndexes.size,
+        outputText: text.join(""),
       };
     },
   };
@@ -321,13 +353,19 @@ function responsesSummary(
     reasoningTokens: usage.output_tokens_details?.reasoning_tokens ?? 0,
     finishReason: responsesFinishReason(response, toolCalls),
     toolCalls,
+    outputText: typeof response.output_text === "string" ? response.output_text : undefined,
   };
 }
 
 function responsesStreamSummary(): ReturnType<StreamSummariser<ResponsesStreamEvent>> {
   let final: ResponsesResponse | undefined;
+  const clock = new FirstChunkClock();
   return {
+    clock,
     onChunk(event) {
+      if (typeof event?.type === "string" && (event.type.endsWith(".delta") || event.type === "response.output_item.added")) {
+        clock.mark();
+      }
       // The terminal event carries the whole response, usage included.
       if (
         event?.response &&
@@ -388,6 +426,7 @@ function emitLlmCall(
   start: number,
   summary: CallSummary,
   stream: boolean,
+  request: OpenAIRequest | undefined = undefined,
 ): void {
   const run = resolveRun(options);
   if (!run) return;
@@ -405,6 +444,14 @@ function emitLlmCall(
     if (summary.toolCalls > 0) data["tool_calls"] = summary.toolCalls;
     if (stream) data["stream"] = true;
     if (options.mode === "batch") data["mode"] = "batch";
+    if (summary.ttftMs !== undefined) data["ttft_ms"] = summary.ttftMs;
+    // Chat Completions carries the system prompt inside messages; the
+    // Responses API has instructions and an input string or item list.
+    putContent(data, {
+      input: request?.messages ?? request?.input,
+      system: request?.instructions,
+      output: summary.outputText,
+    });
     run.event("llm_call", data);
   } catch {
     // swallow

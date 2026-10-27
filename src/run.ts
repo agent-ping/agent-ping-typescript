@@ -13,6 +13,11 @@ export interface RunStartOptions {
    */
   goal?: string;
   /**
+   * The build or prompt version that produced this run, overriding the
+   * init()-level default. Up to 64 characters.
+   */
+  version?: string;
+  /**
    * Close the run automatically once no event has arrived for this long
    * (60-86400). For callers that cannot be relied on to send finish: a browser
    * that gets closed, a process that gets killed. Also makes the run resumable --
@@ -61,6 +66,8 @@ export class Run {
     if (options.customerId) body["customer_id"] = options.customerId;
     if (options.feature) body["feature"] = options.feature;
     if (options.goal) body["goal"] = options.goal;
+    const version = (options.version ?? state.version).trim();
+    if (version) body["version"] = version;
     if (options.metadata) body["metadata"] = options.metadata;
     if (options.idleTimeoutSeconds !== undefined) {
       body["idle_timeout_seconds"] = options.idleTimeoutSeconds;

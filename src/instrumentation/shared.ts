@@ -19,6 +19,7 @@
  */
 
 import { getActiveRun } from "../context.js";
+import { DEFAULT_LLM_CONTENT_MAX_CHARS, getState } from "../state.js";
 
 export interface RunLike {
   event: (type: string, data: Record<string, unknown>) => void;
@@ -40,6 +41,108 @@ export interface ToolPayloadOptions {
 }
 
 export const DEFAULT_TOOL_PAYLOAD_MAX_CHARS = 4000;
+
+/** A message on the wire: what the run page renders as a labelled bubble. */
+export interface WireMessage {
+  role: string;
+  content: string;
+}
+
+/**
+ * Records when a stream's first content chunk arrived. Collectors call
+ * `mark()` when a chunk carries content (text or a tool call), not on
+ * housekeeping events, and `ttftMs(start)` is the time to first token the
+ * Pulse page charts.
+ */
+export class FirstChunkClock {
+  private firstContentAt: number | undefined;
+
+  mark(): void {
+    if (this.firstContentAt === undefined) this.firstContentAt = Date.now();
+  }
+
+  ttftMs(start: number): number | undefined {
+    if (this.firstContentAt === undefined) return undefined;
+    return Math.max(0, this.firstContentAt - start);
+  }
+
+  put(data: Record<string, unknown>, start: number): void {
+    const ttft = this.ttftMs(start);
+    if (ttft !== undefined) data["ttft_ms"] = ttft;
+  }
+}
+
+export function contentCaptureEnabled(): boolean {
+  return getState()?.captureLlmContent ?? false;
+}
+
+export function clipText(text: string, maxChars?: number): string {
+  const limit = maxChars ?? getState()?.llmContentMaxChars ?? DEFAULT_LLM_CONTENT_MAX_CHARS;
+  if (limit > 0 && text.length > limit) return `${text.slice(0, limit)}...`;
+  return text;
+}
+
+/**
+ * Flatten a message's content: a string as is, a list of parts joined, with
+ * non-text parts (images, tool calls, tool results) named in brackets.
+ */
+export function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content === null || content === undefined) return "";
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        const record = asRecord(part);
+        if (!record) return stringifyPayload(part, 200) ?? "";
+        if (typeof record["text"] === "string") return record["text"];
+        const kind = record["type"];
+        const name = record["name"] ?? record["tool_name"] ?? record["id"];
+        if (typeof kind === "string") {
+          return `[${kind}${typeof name === "string" ? ` ${name}` : ""}]`;
+        }
+        return stringifyPayload(part, 200) ?? "";
+      })
+      .join("\n");
+  }
+  return stringifyPayload(content, 200) ?? "";
+}
+
+/** A provider's message list as the wire's [{role, content}], each clipped. */
+export function renderMessages(messages: unknown, defaultRole = "user"): WireMessage[] {
+  if (typeof messages === "string") return [{ role: defaultRole, content: clipText(messages) }];
+  if (!Array.isArray(messages)) return [];
+  return messages.map((message) => {
+    if (typeof message === "string") return { role: defaultRole, content: clipText(message) };
+    const record = asRecord(message) ?? {};
+    const role = typeof record["role"] === "string" && record["role"] ? record["role"] : defaultRole;
+    return { role, content: clipText(messageText(record["content"] ?? record["parts"])) };
+  });
+}
+
+/** Add captured prompt and completion text when the SDK is configured for it. */
+export function putContent(
+  data: Record<string, unknown>,
+  parts: { input?: unknown; output?: unknown; system?: unknown },
+): void {
+  if (!contentCaptureEnabled()) return;
+  if (parts.input !== undefined && parts.input !== null) {
+    const rendered = renderMessages(parts.input);
+    if (rendered.length > 0) data["input"] = rendered;
+  }
+  if (parts.system !== undefined && parts.system !== null) {
+    const text = typeof parts.system === "string" ? parts.system : messageText(parts.system);
+    if (text) data["system_instructions"] = clipText(text);
+  }
+  if (parts.output !== undefined && parts.output !== null) {
+    const text = typeof parts.output === "string" ? parts.output : messageText(parts.output);
+    if (text) data["output"] = clipText(text);
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+}
 
 export function resolveRun(options: InstrumentOptions): RunLike | undefined {
   return options.run ?? getActiveRun();

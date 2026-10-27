@@ -7,6 +7,22 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `init({ version })` and `run(agent, { version })` label every run with the
+  build or prompt version that produced it (`AGENTPING_VERSION` also works).
+  The dashboard's Spend and Verify charts mark where each new version was first
+  seen. `conversation()` takes it too.
+- Streamed Anthropic and OpenAI calls report `ttft_ms`, the time from the
+  request to the first content chunk, charted on Pulse as time to first token.
+- `init({ captureLlmContent: true, llmContentMaxChars: 4000 })` sends the
+  prompt and completion on `instrumentAnthropic` and `instrumentOpenAI`
+  `llm_call` events: `input` as a list of `{role, content}` messages, `output`
+  as text, and `system_instructions`. Off by default; each piece is clipped at
+  the cap. The run page renders them as role-labelled messages.
+- Events carry `turn`, and `conversation()` models a chat session as one run
+  (from the previous unreleased commits).
+
 ## [0.2.0] - 2026-09-17
 
 ### Fixed

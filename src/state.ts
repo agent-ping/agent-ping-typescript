@@ -46,7 +46,24 @@ export interface InitOptions {
   flushIntervalMs?: number;
   batchSize?: number;
   fetchImpl?: typeof fetch;
+  /**
+   * The build or prompt version this process runs, applied to every run that
+   * does not set its own (`AGENTPING_VERSION` also works). The dashboard marks
+   * where each new version was first seen.
+   */
+  version?: string;
+  /**
+   * Send prompt and completion text on the `llm_call` events the Anthropic and
+   * OpenAI wrappers emit (`input` as {role, content} messages, `output`,
+   * `system_instructions`). Off by default: turn it on only when your prompts
+   * may leave your infrastructure.
+   */
+  captureLlmContent?: boolean;
+  /** Truncate each captured piece at this length. Default 4000. */
+  llmContentMaxChars?: number;
 }
+
+export const DEFAULT_LLM_CONTENT_MAX_CHARS = 4000;
 
 export interface StatusSnapshot {
   queueSize: number;
@@ -66,6 +83,9 @@ export interface SdkState {
   controlClient: HttpClient;
   flushIntervalMs: number;
   batchSize: number;
+  version: string;
+  captureLlmContent: boolean;
+  llmContentMaxChars: number;
 }
 
 const KNOWN_REGIONS = new Set(["eu", "us"]);
@@ -155,6 +175,11 @@ export function initState(options: InitOptions = {}): SdkState {
   });
   const flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
   const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
+  const version = (
+    options.version ??
+    (typeof process !== "undefined" ? process.env["AGENTPING_VERSION"] : undefined) ??
+    ""
+  ).trim();
   const worker = new Worker({ queue, client, flushIntervalMs, batchSize });
 
   current = {
@@ -168,6 +193,9 @@ export function initState(options: InitOptions = {}): SdkState {
     controlClient,
     flushIntervalMs,
     batchSize,
+    version,
+    captureLlmContent: options.captureLlmContent ?? false,
+    llmContentMaxChars: Math.max(0, options.llmContentMaxChars ?? DEFAULT_LLM_CONTENT_MAX_CHARS),
   };
 
   worker.start();
