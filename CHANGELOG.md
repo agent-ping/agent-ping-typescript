@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-28
+
 ### Added
 
 - `init({ version })` and `run(agent, { version })` label every run with the
@@ -35,8 +37,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   response's `output_text` as `output`, the agent's string `instructions` as
   `system_instructions`, and `onLLMStart(context, agent, systemPrompt?,
   inputItems?)` takes the prompt for `input`.
-- Events carry `turn`, and `conversation()` models a chat session as one run
-  (from the previous unreleased commits).
+- Events carry `turn`, the exchange they belong to, and `conversation()` models a
+  chat session as one run: every turn lands on a run whose id is derived
+  from the session id, so a stateless handler rebuilds it on any turn, and
+  an idle timeout (15 minutes by default) closes it as success when the user
+  walks away. The idle timeout and its closing status are settable on any run.
 
 ## [0.2.0] - 2026-09-17
 
@@ -138,6 +143,7 @@ The 0.x line is pre-1.0. Public API may change before 1.0.0. We do not
 break the wire format between SDK and ingest without a version bump and
 a migration note here.
 
-[Unreleased]: https://github.com/agent-ping/agent-ping-typescript/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/agent-ping/agent-ping-typescript/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/agent-ping/agent-ping-typescript/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/agent-ping/agent-ping-typescript/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/agent-ping/agent-ping-typescript/releases/tag/v0.1.0
