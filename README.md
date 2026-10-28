@@ -172,13 +172,6 @@ keep payloads out of AgentPing.
 
 Per-integration docs:
 [Anthropic](https://agentping.io/docs/providers/anthropic) ·
-
-Prompt and completion text are off by default. Turn them on with
-`agentping.init({ captureLlmContent: true })` and `instrumentAnthropic` and
-`instrumentOpenAI` add `input` (a list of `{role, content}` messages), `output`
-and `system_instructions` to each `llm_call`, each clipped at
-`llmContentMaxChars` (default 4000). The run page shows them as messages.
-Streamed calls also report `ttft_ms`, the time to the first content chunk.
 [OpenAI](https://agentping.io/docs/providers/openai) ·
 [Gemini](https://agentping.io/docs/providers/gemini) ·
 [Mistral](https://agentping.io/docs/providers/mistral) ·
@@ -187,6 +180,26 @@ Streamed calls also report `ttft_ms`, the time to the first content chunk.
 [LangChain.js](https://agentping.io/docs/frameworks/langchain) ·
 [Vercel AI SDK](https://agentping.io/docs/frameworks/vercel-ai) ·
 [OpenAI Agents](https://agentping.io/docs/frameworks/openai-agents).
+
+Prompt and completion text are off by default. Turn them on with
+`agentping.init({ captureLlmContent: true })` and every provider wrapper
+(`instrumentAnthropic`, `instrumentOpenAI`, `instrumentGemini`,
+`instrumentMistral`, `instrumentCohere` and `instrumentBedrock` for Converse)
+adds `input` (a list of `{role, content}` messages), `output` and
+`system_instructions` to its `llm_call`, each clipped at `llmContentMaxChars`
+(default 4000). Non-text parts (images, tool calls, tool results) appear as
+bracketed markers, Gemini's `model` role is reported as `assistant`, and
+Bedrock InvokeModel bodies are not captured. The run page shows them as
+messages. The framework integrations follow suit where the framework exposes
+the data: the LangChain.js handler sends `input`, `system_instructions` and
+`output`, `withAgentPing` sends `output`, and the Agents SDK hooks send
+`output` and the agent's `instructions` (pass the system prompt and input
+items to `onLLMStart` for `input`).
+
+Streamed provider calls also report `ttft_ms`, the time to the first content
+chunk. The LangChain.js handler measures it from `handleLLMNewToken` and
+`withAgentPing` from `streamText`'s `onChunk`; the Agents SDK runs its stream
+internally and gives no hook.
 
 ## Contract guarantees
 

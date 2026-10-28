@@ -13,13 +13,28 @@ adheres to [Semantic Versioning](https://semver.org/).
   build or prompt version that produced it (`AGENTPING_VERSION` also works).
   The dashboard's Spend and Verify charts mark where each new version was first
   seen. `conversation()` takes it too.
-- Streamed Anthropic and OpenAI calls report `ttft_ms`, the time from the
-  request to the first content chunk, charted on Pulse as time to first token.
+- Streamed provider calls (Anthropic, OpenAI, Gemini, Mistral, Cohere and
+  Bedrock ConverseStream) report `ttft_ms`, the time from the request to the
+  first content chunk, charted on Pulse as time to first token.
 - `init({ captureLlmContent: true, llmContentMaxChars: 4000 })` sends the
-  prompt and completion on `instrumentAnthropic` and `instrumentOpenAI`
-  `llm_call` events: `input` as a list of `{role, content}` messages, `output`
-  as text, and `system_instructions`. Off by default; each piece is clipped at
-  the cap. The run page renders them as role-labelled messages.
+  prompt and completion on every provider wrapper's `llm_call`
+  (`instrumentAnthropic`, `instrumentOpenAI`, `instrumentGemini`,
+  `instrumentMistral`, `instrumentCohere` and `instrumentBedrock` for
+  Converse): `input` as a list of `{role, content}` messages, `output` as
+  text, and `system_instructions`. Off by default; each piece is clipped at
+  the cap. Non-text parts appear as bracketed markers such as `[image]` or
+  `[tool_use lookup]`, Gemini's `model` role is reported as `assistant`, and
+  Bedrock InvokeModel bodies are not captured. The run page renders them as
+  role-labelled messages.
+- The framework integrations report the same where the framework exposes it:
+  `AgentPingLangChainCallbackHandler` sends `input`, `system_instructions`,
+  `output`, and `stream: true` plus `ttft_ms` when `handleLLMNewToken` fires;
+  `withAgentPing` now also returns `onChunk`, so `streamText` reports
+  `stream: true` and `ttft_ms` (per step with `perStep: true`), and `output`
+  comes from the finish event's `text`; `AgentPingHooks.onLLMEnd` sends the
+  response's `output_text` as `output`, the agent's string `instructions` as
+  `system_instructions`, and `onLLMStart(context, agent, systemPrompt?,
+  inputItems?)` takes the prompt for `input`.
 - Events carry `turn`, and `conversation()` models a chat session as one run
   (from the previous unreleased commits).
 

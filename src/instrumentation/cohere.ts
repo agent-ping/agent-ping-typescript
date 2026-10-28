@@ -1,7 +1,11 @@
 import { wrapAsyncIterable } from "./streaming.js";
 import {
+  FirstChunkClock,
+  contentCaptureEnabled,
   emitErroredLlmCall,
   isPromiseLike,
+  messageText,
+  putContent,
   putIfString,
   resolveRun,
   type InstrumentOptions as BaseInstrumentOptions,
@@ -22,8 +26,30 @@ interface CohereUsage {
 interface CohereResponse {
   usage?: CohereUsage;
   finishReason?: string;
-  message?: { toolCalls?: unknown[] };
+  message?: { toolCalls?: unknown[]; content?: unknown };
 }
+
+/** The request fields capture reads. */
+interface CohereRequest {
+  model?: string;
+  messages?: unknown;
+}
+
+/** Fields that ride along with the usage: request for capture, stream timing and text. */
+interface CallExtras {
+  request?: CohereRequest;
+  ttftMs?: number;
+  outputText?: string;
+}
+
+/** Stream events that carry model output rather than housekeeping. */
+const CONTENT_EVENTS = new Set([
+  "content-start",
+  "content-delta",
+  "tool-plan-delta",
+  "tool-call-start",
+  "tool-call-delta",
+]);
 
 interface InstrumentableCohereClient {
   chat: (...args: unknown[]) => unknown;
@@ -33,7 +59,7 @@ interface InstrumentableCohereClient {
 
 interface CohereStreamEvent {
   type?: string;
-  delta?: { usage?: CohereUsage; finishReason?: string };
+  delta?: { usage?: CohereUsage; finishReason?: string; message?: { content?: { text?: string } } };
 }
 
 interface CohereEmbedResponse {
@@ -60,7 +86,7 @@ export function instrumentCohere<T extends InstrumentableCohereClient>(
 
   const wrappedChat = (...args: unknown[]): unknown => {
     const start = Date.now();
-    const firstArg = args[0] as { model?: string } | undefined;
+    const firstArg = args[0] as CohereRequest | undefined;
     const requestedModel = firstArg?.model;
 
     let result: unknown;
@@ -71,17 +97,17 @@ export function instrumentCohere<T extends InstrumentableCohereClient>(
       throw err;
     }
 
-    return wrapResponsePromise(result, options, start, requestedModel);
+    return wrapResponsePromise(result, options, start, firstArg);
   };
 
   const wrappedChatStream = originalChatStream
     ? (...args: unknown[]): unknown => {
         const start = Date.now();
-        const firstArg = args[0] as { model?: string } | undefined;
+        const firstArg = args[0] as CohereRequest | undefined;
         const requestedModel = firstArg?.model;
         try {
           const result = originalChatStream(...args);
-          return wrapStreamPromise(result, options, start, requestedModel);
+          return wrapStreamPromise(result, options, start, firstArg);
         } catch (err) {
           emitErroredLlmCall(options, PROVIDER, requestedModel, start, err, { stream: true });
           throw err;
@@ -118,35 +144,44 @@ function wrapStreamPromise(
   result: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: CohereRequest | undefined,
 ): unknown {
   if (isPromiseLike(result)) {
     return result.then(
-      (stream: unknown) => wrapStreamResult(stream, options, start, requestedModel),
+      (stream: unknown) => wrapStreamResult(stream, options, start, request),
       (err: unknown) => {
-        emitErroredLlmCall(options, PROVIDER, requestedModel, start, err, { stream: true });
+        emitErroredLlmCall(options, PROVIDER, request?.model, start, err, { stream: true });
         throw err;
       },
     );
   }
-  return wrapStreamResult(result, options, start, requestedModel);
+  return wrapStreamResult(result, options, start, request);
 }
 
 function wrapStreamResult(
   stream: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: CohereRequest | undefined,
 ): unknown {
   if (!stream || typeof stream !== "object") return stream;
   if (!(Symbol.asyncIterator in stream)) return stream;
 
+  const requestedModel = request?.model;
   let billed: CohereBilledUnits | undefined;
   let finishReason: string | undefined;
   let toolCalls = 0;
+  const clock = new FirstChunkClock();
+  const text: string[] = [];
+  const capture = contentCaptureEnabled();
 
   return wrapAsyncIterable(stream as AsyncIterable<CohereStreamEvent>, {
     onChunk(event: CohereStreamEvent): void {
+      if (event?.type && CONTENT_EVENTS.has(event.type)) clock.mark();
+      if (event?.type === "content-delta" && capture) {
+        const piece = event.delta?.message?.content?.text;
+        if (typeof piece === "string") text.push(piece);
+      }
       if (event?.type === "tool-call-start") toolCalls += 1;
       if (event?.type === "message-end") {
         const b = event.delta?.usage?.billedUnits;
@@ -161,6 +196,7 @@ function wrapStreamResult(
         requestedModel,
         billed ? { usage: { billedUnits: billed } } : {},
         { stream: true, finishReason, toolCalls },
+        { request, ttftMs: clock.ttftMs(start), outputText: text.join("") },
       );
     },
     onError(err: unknown): void {
@@ -219,19 +255,24 @@ function wrapResponsePromise(
   result: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: CohereRequest | undefined,
 ): unknown {
+  const emit = (response: CohereResponse): void =>
+    emitLlmCall(options, start, request?.model, response, undefined, {
+      request,
+      outputText: messageText(response?.message?.content),
+    });
   if (!isPromiseLike(result)) {
-    emitLlmCall(options, start, requestedModel, result as CohereResponse);
+    emit(result as CohereResponse);
     return result;
   }
   return result.then(
     (response: unknown) => {
-      emitLlmCall(options, start, requestedModel, response as CohereResponse);
+      emit(response as CohereResponse);
       return response;
     },
     (err: unknown) => {
-      emitErroredLlmCall(options, PROVIDER, requestedModel, start, err);
+      emitErroredLlmCall(options, PROVIDER, request?.model, start, err);
       throw err;
     },
   );
@@ -243,6 +284,7 @@ function emitLlmCall(
   requestedModel: string | undefined,
   response: CohereResponse,
   streamInfo?: { stream: true; finishReason?: string; toolCalls: number },
+  extras: CallExtras = {},
 ): void {
   const run = resolveRun(options);
   if (!run) return;
@@ -260,7 +302,10 @@ function emitLlmCall(
     const toolCalls = streamInfo ? streamInfo.toolCalls : response.message?.toolCalls?.length ?? 0;
     if (toolCalls > 0) data["tool_calls"] = toolCalls;
     if (streamInfo) data["stream"] = true;
+    if (extras.ttftMs !== undefined) data["ttft_ms"] = extras.ttftMs;
     if (options.mode === "batch") data["mode"] = "batch";
+    // Cohere carries the system prompt inside messages, so it stays in input.
+    putContent(data, { input: extras.request?.messages, output: extras.outputText });
     run.event("llm_call", data);
   } catch {
     // swallow

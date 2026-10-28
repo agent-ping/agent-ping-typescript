@@ -1,7 +1,11 @@
 import { wrapAsyncIterable } from "./streaming.js";
 import {
+  FirstChunkClock,
+  contentCaptureEnabled,
   emitErroredLlmCall,
   isPromiseLike,
+  messageText,
+  putContent,
   putIfString,
   resolveRun,
   type InstrumentOptions as BaseInstrumentOptions,
@@ -20,8 +24,21 @@ interface MistralToolCall {
 
 interface MistralChoice {
   finishReason?: string | null;
-  message?: { toolCalls?: MistralToolCall[] | null };
-  delta?: { toolCalls?: MistralToolCall[] | null };
+  message?: { toolCalls?: MistralToolCall[] | null; content?: unknown };
+  delta?: { toolCalls?: MistralToolCall[] | null; content?: unknown };
+}
+
+/** The request fields capture reads. */
+interface MistralRequest {
+  model?: string;
+  messages?: unknown;
+}
+
+/** Fields that ride along with the usage: request for capture, stream timing and text. */
+interface CallExtras {
+  request?: MistralRequest;
+  ttftMs?: number;
+  outputText?: string;
 }
 
 interface MistralResponse {
@@ -58,7 +75,7 @@ export function instrumentMistral<T extends MistralClient>(
 
   const wrappedComplete = (...args: unknown[]): unknown => {
     const start = Date.now();
-    const firstArg = args[0] as { model?: string } | undefined;
+    const firstArg = args[0] as MistralRequest | undefined;
     const requestedModel = firstArg?.model;
 
     let result: unknown;
@@ -69,17 +86,17 @@ export function instrumentMistral<T extends MistralClient>(
       throw err;
     }
 
-    return wrapResponsePromise(result, options, start, requestedModel);
+    return wrapResponsePromise(result, options, start, firstArg);
   };
 
   const wrappedStream = originalStream
     ? (...args: unknown[]): unknown => {
         const start = Date.now();
-        const firstArg = args[0] as { model?: string } | undefined;
+        const firstArg = args[0] as MistralRequest | undefined;
         const requestedModel = firstArg?.model;
         try {
           const result = originalStream(...args);
-          return wrapStreamPromise(result, options, start, requestedModel);
+          return wrapStreamPromise(result, options, start, firstArg);
         } catch (err) {
           emitErroredLlmCall(options, PROVIDER, requestedModel, start, err, { stream: true });
           throw err;
@@ -111,33 +128,36 @@ function wrapStreamPromise(
   result: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: MistralRequest | undefined,
 ): unknown {
   if (isPromiseLike(result)) {
     return result.then(
-      (stream: unknown) => wrapStreamResult(stream, options, start, requestedModel),
+      (stream: unknown) => wrapStreamResult(stream, options, start, request),
       (err: unknown) => {
-        emitErroredLlmCall(options, PROVIDER, requestedModel, start, err, { stream: true });
+        emitErroredLlmCall(options, PROVIDER, request?.model, start, err, { stream: true });
         throw err;
       },
     );
   }
-  return wrapStreamResult(result, options, start, requestedModel);
+  return wrapStreamResult(result, options, start, request);
 }
 
 function wrapStreamResult(
   stream: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: MistralRequest | undefined,
 ): unknown {
   if (!stream || typeof stream !== "object") return stream;
   if (!(Symbol.asyncIterator in stream)) return stream;
 
-  let model: string | undefined = requestedModel;
+  let model: string | undefined = request?.model;
   let usage: MistralUsage | undefined;
   let finishReason: string | undefined;
   const toolCallIndexes = new Set<number>();
+  const clock = new FirstChunkClock();
+  const text: string[] = [];
+  const capture = contentCaptureEnabled();
 
   return wrapAsyncIterable(stream as AsyncIterable<MistralStreamEvent>, {
     onChunk(event: MistralStreamEvent): void {
@@ -146,16 +166,24 @@ function wrapStreamResult(
       if (data?.usage) usage = data.usage;
       const choice = data?.choices?.[0];
       if (choice?.finishReason) finishReason = choice.finishReason;
-      for (const call of choice?.delta?.toolCalls ?? []) {
+      const toolCalls = choice?.delta?.toolCalls ?? [];
+      for (const call of toolCalls) {
         toolCallIndexes.add(call.index ?? toolCallIndexes.size);
       }
+      const content = choice?.delta?.content;
+      const hasText = typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
+      if (hasText || toolCalls.length > 0) clock.mark();
+      if (capture && hasText) text.push(messageText(content));
     },
     onDone(): void {
-      emitLlmCall(options, start, model, { model, usage }, {
-        stream: true,
-        finishReason,
-        toolCalls: toolCallIndexes.size,
-      });
+      emitLlmCall(
+        options,
+        start,
+        model,
+        { model, usage },
+        { stream: true, finishReason, toolCalls: toolCallIndexes.size },
+        { request, ttftMs: clock.ttftMs(start), outputText: text.join("") },
+      );
     },
     onError(err: unknown): void {
       emitErroredLlmCall(options, PROVIDER, model, start, err, { stream: true });
@@ -167,19 +195,24 @@ function wrapResponsePromise(
   result: unknown,
   options: InstrumentOptions,
   start: number,
-  requestedModel: string | undefined,
+  request: MistralRequest | undefined,
 ): unknown {
+  const emit = (response: MistralResponse): void =>
+    emitLlmCall(options, start, request?.model, response, undefined, {
+      request,
+      outputText: messageText(response?.choices?.[0]?.message?.content),
+    });
   if (!isPromiseLike(result)) {
-    emitLlmCall(options, start, requestedModel, result as MistralResponse);
+    emit(result as MistralResponse);
     return result;
   }
   return result.then(
     (response: unknown) => {
-      emitLlmCall(options, start, requestedModel, response as MistralResponse);
+      emit(response as MistralResponse);
       return response;
     },
     (err: unknown) => {
-      emitErroredLlmCall(options, PROVIDER, requestedModel, start, err);
+      emitErroredLlmCall(options, PROVIDER, request?.model, start, err);
       throw err;
     },
   );
@@ -191,6 +224,7 @@ function emitLlmCall(
   requestedModel: string | undefined,
   response: MistralResponse,
   streamInfo?: { stream: true; finishReason?: string; toolCalls: number },
+  extras: CallExtras = {},
 ): void {
   const run = resolveRun(options);
   if (!run) return;
@@ -209,7 +243,10 @@ function emitLlmCall(
     const toolCalls = streamInfo ? streamInfo.toolCalls : choice?.message?.toolCalls?.length ?? 0;
     if (toolCalls > 0) data["tool_calls"] = toolCalls;
     if (streamInfo) data["stream"] = true;
+    if (extras.ttftMs !== undefined) data["ttft_ms"] = extras.ttftMs;
     if (options.mode === "batch") data["mode"] = "batch";
+    // Mistral carries the system prompt inside messages, so it stays in input.
+    putContent(data, { input: extras.request?.messages, output: extras.outputText });
     run.event("llm_call", data);
   } catch {
     // swallow
