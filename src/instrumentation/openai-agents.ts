@@ -26,12 +26,18 @@
  *     setDefaultOpenAIClient(instrumentOpenAI(new OpenAI(), { run }));
  *
  * `onLLMStart` / `onLLMEnd` remain for code that already calls them by
- * hand with a `{ usage }` response.
+ * hand with a `{ usage }` response. With `init({ captureLlmContent: true })`
+ * that `llm_call` also carries the `output_text` of the response's
+ * assistant messages as `output`, the agent's string `instructions` as
+ * `system_instructions`, and, when `onLLMStart` is given the system prompt
+ * and input items, those as `system_instructions` and `input`. The SDK
+ * runs the stream itself, so there is no `ttft_ms` here.
  */
 
 import { getActiveRun } from "../context.js";
 import {
   DEFAULT_TOOL_PAYLOAD_MAX_CHARS,
+  putContent,
   putIfPositive,
   putIfString,
   stringifyPayload,
@@ -47,13 +53,30 @@ interface AgentsUsage {
   outputTokensDetails?: Array<{ reasoning_tokens?: number }> | { reasoning_tokens?: number };
 }
 
+/** A `ModelResponse` output item; only assistant messages are read here. */
+interface AgentsOutputItem {
+  type?: string;
+  role?: string;
+  content?: unknown;
+}
+
 interface AgentsModelResponse {
   usage?: AgentsUsage;
+  output?: AgentsOutputItem[];
 }
 
 interface AgentsAgent {
   name?: string;
   model?: unknown;
+  /** A string, or a function the SDK resolves at run time (not read). */
+  instructions?: unknown;
+}
+
+/** What `onLLMStart` saw, folded into the `llm_call` by `onLLMEnd`. */
+interface AgentsLlmStart {
+  start: number;
+  systemPrompt?: unknown;
+  input?: unknown;
 }
 
 interface AgentsTool {
@@ -69,7 +92,7 @@ interface HookEmitter {
 }
 
 export class AgentPingHooks {
-  private llmStarts = new WeakMap<object, number>();
+  private llmStarts = new WeakMap<object, AgentsLlmStart>();
   private agentStarts = new WeakMap<object, Map<string, number>>();
   private toolStarts = new WeakMap<object, Map<string, number>>();
   private explicitRun?: RunLike;
@@ -116,8 +139,18 @@ export class AgentPingHooks {
     return emitter;
   }
 
-  async onLLMStart(context: object, _agent: AgentsAgent): Promise<void> {
-    this.llmStarts.set(context, Date.now());
+  /**
+   * `systemPrompt` and `inputItems` are optional: pass the resolved system
+   * prompt and the model input (a string or message items) so content
+   * capture can report them on the `llm_call`.
+   */
+  async onLLMStart(
+    context: object,
+    _agent: AgentsAgent,
+    systemPrompt?: unknown,
+    inputItems?: unknown,
+  ): Promise<void> {
+    this.llmStarts.set(context, { start: Date.now(), systemPrompt, input: inputItems });
   }
 
   async onLLMEnd(
@@ -125,7 +158,8 @@ export class AgentPingHooks {
     agent: AgentsAgent,
     response: AgentsModelResponse,
   ): Promise<void> {
-    const start = this.llmStarts.get(context);
+    const startInfo = this.llmStarts.get(context);
+    const start = startInfo?.start;
     const latencyMs = start ? Date.now() - start : 0;
     this.llmStarts.delete(context);
 
@@ -143,6 +177,11 @@ export class AgentPingHooks {
       };
       putIfPositive(data, "cached_input_tokens", firstDetail(usage.inputTokensDetails, "cached_tokens"));
       putIfPositive(data, "reasoning_tokens", firstDetail(usage.outputTokensDetails, "reasoning_tokens"));
+      putContent(data, {
+        input: inputMessages(startInfo?.input),
+        system: startInfo?.systemPrompt ?? (typeof agent.instructions === "string" ? agent.instructions : undefined),
+        output: outputText(response.output),
+      });
       run.event("llm_call", data);
     } catch {
       // swallow
@@ -246,6 +285,37 @@ export class AgentPingHooks {
       // swallow
     }
   }
+}
+
+/**
+ * The model input as messages: a plain string is the user turn; from an
+ * item list only the role-bearing message items are kept (function calls
+ * and their results are reported as `tool_call` events already).
+ */
+function inputMessages(input: unknown): unknown {
+  if (typeof input === "string") return input;
+  if (!Array.isArray(input)) return undefined;
+  const messages = input.filter(
+    (item) =>
+      typeof item === "string" ||
+      (item && typeof item === "object" && typeof (item as { role?: unknown }).role === "string"),
+  );
+  return messages.length > 0 ? messages : undefined;
+}
+
+/** The `output_text` parts of the response's assistant messages, joined. */
+function outputText(output: AgentsOutputItem[] | undefined): string | undefined {
+  if (!Array.isArray(output)) return undefined;
+  const messages: string[] = [];
+  for (const item of output) {
+    if (item?.type !== "message" || !Array.isArray(item.content)) continue;
+    const text = (item.content as Array<{ type?: string; text?: unknown }>)
+      .filter((part) => part?.type === "output_text" && typeof part.text === "string")
+      .map((part) => part.text as string)
+      .join("");
+    if (text) messages.push(text);
+  }
+  return messages.length > 0 ? messages.join("\n") : undefined;
 }
 
 function toolKey(tool: AgentsTool, details?: AgentsToolDetails): string {

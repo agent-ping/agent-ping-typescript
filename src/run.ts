@@ -12,6 +12,28 @@ export interface RunStartOptions {
    * without it the review has little to judge against.
    */
   goal?: string;
+  /**
+   * The build or prompt version that produced this run, overriding the
+   * init()-level default. Up to 64 characters.
+   */
+  version?: string;
+  /**
+   * Close the run automatically once no event has arrived for this long
+   * (60-86400). For callers that cannot be relied on to send finish: a browser
+   * that gets closed, a process that gets killed. Also makes the run resumable --
+   * a later event reopens it. See conversation().
+   */
+  idleTimeoutSeconds?: number;
+  /**
+   * What that silence meant. Defaults server-side to "timeout": we stopped
+   * waiting, we do not know how it went. A chat should send "success".
+   */
+  idleTimeoutStatus?: "success" | "failed" | "timeout" | "cancelled";
+  /**
+   * Reuse a known run id and start time instead of minting new ones, so a
+   * stateless backend can re-open the same conversation on a later request.
+   */
+  resume?: { id: string; startedAt: string };
 }
 
 export interface RunFinishOptions {
@@ -32,9 +54,9 @@ export class Run {
     agent: string,
     options: RunStartOptions = {},
   ) {
-    this.id = newId("run", state.region);
+    this.id = options.resume?.id ?? newId("run", state.region);
     this.agent = agent;
-    this.startedAt = new Date().toISOString();
+    this.startedAt = options.resume?.startedAt ?? new Date().toISOString();
 
     const body: Record<string, unknown> = {
       id: this.id,
@@ -44,7 +66,13 @@ export class Run {
     if (options.customerId) body["customer_id"] = options.customerId;
     if (options.feature) body["feature"] = options.feature;
     if (options.goal) body["goal"] = options.goal;
+    const version = (options.version ?? state.version).trim();
+    if (version) body["version"] = version;
     if (options.metadata) body["metadata"] = options.metadata;
+    if (options.idleTimeoutSeconds !== undefined) {
+      body["idle_timeout_seconds"] = options.idleTimeoutSeconds;
+      if (options.idleTimeoutStatus) body["idle_timeout_status"] = options.idleTimeoutStatus;
+    }
     const parent =
       options.parentRunId ??
       (typeof process !== "undefined"
@@ -56,7 +84,15 @@ export class Run {
     state.worker.notifyEnqueued();
   }
 
-  event(type: string, data: Record<string, unknown> = {}): void {
+  /**
+   * Append an event to the run.
+   *
+   * @param turn Which exchange of a conversation this belongs to, counting from
+   *   1. One turn is often several events -- call the model, run a tool, call it
+   *   again -- and this is what groups them. Omit for work that is not a
+   *   conversation.
+   */
+  event(type: string, data: Record<string, unknown> = {}, turn?: number): void {
     try {
       if (this.finished) {
         warnOnce(
@@ -71,6 +107,7 @@ export class Run {
         ts: new Date().toISOString(),
         data,
       };
+      if (turn !== undefined) event["turn"] = turn;
       this.state.queue.push({
         kind: "run_events",
         runId: this.id,

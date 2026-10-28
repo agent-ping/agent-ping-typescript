@@ -7,9 +7,12 @@
  *
  * - `withAgentPing(run, options?)` - returns a partial options object you
  *   can spread into `generateText` / `streamText` calls. It populates
- *   `onFinish` and `onStepFinish` with handlers that emit events into
- *   the run. Provider + model are read from the event payload (AI SDK v5
- *   exposes `response.modelId` and the model object).
+ *   `onFinish`, `onStepFinish` and `onChunk` with handlers that emit
+ *   events into the run. Provider + model are read from the event payload
+ *   (AI SDK v5 exposes `response.modelId` and the model object). `onChunk`
+ *   only fires on `streamText` (`generateText` ignores it); when it does,
+ *   the `llm_call` carries `stream: true` and `ttft_ms`, the time from
+ *   `withAgentPing()` to the first text or tool-call chunk.
  *
  * - `agentPingOnFinish(run, options?)` - returns just the `onFinish`
  *   callback for cases where you want to compose with your own handlers.
@@ -19,12 +22,19 @@
  * per tool the model used. With `perStep: true` each model step becomes
  * its own `llm_call` (with its tool calls after it) and `onFinish` emits
  * nothing, so tokens are never priced twice.
+ *
+ * With `init({ captureLlmContent: true })` each `llm_call` carries the
+ * generated `text` as `output`. The finish events don't include the
+ * prompt the call was made with, so `input` and `system_instructions`
+ * are not reported here.
  */
 
 import { getActiveRun } from "../context.js";
 import {
   DEFAULT_TOOL_PAYLOAD_MAX_CHARS,
+  FirstChunkClock,
   errorFields,
+  putContent,
   putIfPositive,
   putIfString,
   stringifyPayload,
@@ -73,7 +83,14 @@ interface AISDKResponseMetadata {
   providerMetadata?: Record<string, unknown>;
 }
 
+/** A `streamText` `onChunk` part; only its `type` is read. */
+interface AISDKStreamPart {
+  type?: string;
+}
+
 interface StepLike {
+  /** The text generated in this step (or, on `onFinish`, by the last step). */
+  text?: string;
   usage?: AISDKUsage;
   finishReason?: string;
   toolCalls?: AISDKToolCall[];
@@ -84,7 +101,6 @@ interface StepLike {
 }
 
 interface OnFinishPayload extends StepLike {
-  text?: string;
   /** AI SDK v5: usage summed over every step. */
   totalUsage?: AISDKUsage;
   /** AI SDK v5: one entry per model step. */
@@ -105,6 +121,8 @@ interface WithAgentPingOptions extends ToolPayloadOptions {
 interface AgentPingAISDKOptions {
   onFinish: (event: OnFinishPayload) => void;
   onStepFinish?: (event: OnStepFinishPayload) => void;
+  /** Marks the time to first token on `streamText`; `generateText` never calls it. */
+  onChunk?: (event: { chunk?: AISDKStreamPart }) => void;
 }
 
 export function withAgentPing(
@@ -122,8 +140,20 @@ export function withAgentPing(
     : ((runOrOptions as WithAgentPingOptions) ?? {});
 
   const start = Date.now();
+  // First content chunk of the current step; `onChunk` only fires on streamText.
+  let clock = new FirstChunkClock();
+  let streamed = false;
 
   const resolveRun = (): RunLike | undefined => explicitRun ?? getActiveRun();
+
+  const onChunk = (event: { chunk?: AISDKStreamPart }): void => {
+    try {
+      streamed = true;
+      if (isContentPart(event?.chunk?.type)) clock.mark();
+    } catch {
+      // swallow
+    }
+  };
 
   const onFinish = (event: OnFinishPayload): void => {
     // Per-step mode already reported every step as it finished.
@@ -135,6 +165,9 @@ export function withAgentPing(
     emitLlmCall(run, provider, model, start, event.totalUsage ?? event.usage, {
       finishReason: event.finishReason,
       toolCalls: steps.length > 0 ? sum(steps, (s) => s.toolCalls?.length ?? 0) : event.toolCalls?.length ?? 0,
+      stream: streamed,
+      ttftMs: clock.ttftMs(start),
+      outputText: event.text,
     });
     if (steps.length > 0) {
       for (const step of steps) emitToolCalls(run, step, options);
@@ -143,20 +176,26 @@ export function withAgentPing(
     }
   };
 
-  const out: AgentPingAISDKOptions = { onFinish };
+  const out: AgentPingAISDKOptions = { onFinish, onChunk };
 
   if (options.perStep) {
     let stepStart = Date.now();
     out.onStepFinish = (event: OnStepFinishPayload): void => {
       const run = resolveRun();
-      if (!run) return;
-      const { provider, model } = resolveProviderModel(event, options);
-      emitLlmCall(run, provider, model, stepStart, event.usage, {
-        finishReason: event.finishReason,
-        toolCalls: event.toolCalls?.length ?? 0,
-      });
-      emitToolCalls(run, event, options);
+      if (run) {
+        const { provider, model } = resolveProviderModel(event, options);
+        emitLlmCall(run, provider, model, stepStart, event.usage, {
+          finishReason: event.finishReason,
+          toolCalls: event.toolCalls?.length ?? 0,
+          stream: streamed,
+          ttftMs: clock.ttftMs(stepStart),
+          outputText: event.text,
+        });
+        emitToolCalls(run, event, options);
+      }
+      // The next step's chunks start a fresh first-token clock.
       stepStart = Date.now();
+      clock = new FirstChunkClock();
     };
   }
 
@@ -217,6 +256,22 @@ function resolveProviderModel(
   };
 }
 
+/**
+ * Whether a stream part is model content. Text and reasoning deltas and
+ * tool-call parts (v4 `tool-call-streaming-start` / `tool-call-delta`, v5
+ * `tool-input-start` / `tool-input-delta`) count; sources, tool results
+ * and raw provider events don't.
+ */
+function isContentPart(type: string | undefined): boolean {
+  if (typeof type !== "string") return false;
+  return (
+    type.startsWith("text") ||
+    type.startsWith("reasoning") ||
+    type.startsWith("tool-call") ||
+    type.startsWith("tool-input")
+  );
+}
+
 function sum<T>(items: T[], pick: (item: T) => number): number {
   return items.reduce((total, item) => total + pick(item), 0);
 }
@@ -227,7 +282,13 @@ function emitLlmCall(
   model: string,
   start: number,
   usage: AISDKUsage | undefined,
-  info: { finishReason?: string; toolCalls: number },
+  info: {
+    finishReason?: string;
+    toolCalls: number;
+    stream?: boolean;
+    ttftMs?: number;
+    outputText?: string;
+  },
 ): void {
   try {
     const latencyMs = Date.now() - start;
@@ -244,6 +305,9 @@ function emitLlmCall(
     putIfPositive(data, "reasoning_tokens", usage?.reasoningTokens);
     putIfString(data, "finish_reason", info.finishReason);
     if (info.toolCalls > 0) data["tool_calls"] = info.toolCalls;
+    if (info.stream) data["stream"] = true;
+    if (info.ttftMs !== undefined) data["ttft_ms"] = info.ttftMs;
+    putContent(data, { output: info.outputText });
     run.event("llm_call", data);
   } catch {
     // swallow
